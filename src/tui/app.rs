@@ -738,6 +738,20 @@ impl App {
         self.edit_state = Some(edit);
     }
 
+    /// If the cursor is on a root (folder) node, move down to the next file.
+    fn skip_root_node_down(&mut self) {
+        if self.tree_state.selected().len() == 1 {
+            self.tree_state.key_down();
+        }
+    }
+
+    /// If the cursor is on a root (folder) node, move up to the previous file.
+    fn skip_root_node_up(&mut self) {
+        if self.tree_state.selected().len() == 1 {
+            self.tree_state.key_up();
+        }
+    }
+
     fn select_tree_item(&mut self) {
         let selected = self.tree_state.selected();
         if selected.is_empty() {
@@ -1102,10 +1116,12 @@ impl App {
             }
             KeyCode::Down | KeyCode::Char('j') if self.active_pane == Pane::FileList => {
                 self.tree_state.key_down();
+                self.skip_root_node_down();
                 self.load_selected_content();
             }
             KeyCode::Up | KeyCode::Char('k') if self.active_pane == Pane::FileList => {
                 self.tree_state.key_up();
+                self.skip_root_node_up();
                 self.load_selected_content();
             }
             KeyCode::Left | KeyCode::Char('h') if self.active_pane == Pane::FileList => {
