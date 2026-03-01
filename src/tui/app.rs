@@ -1,5 +1,7 @@
+use std::cell::Cell;
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -25,13 +27,16 @@ use ratatui::widgets::Paragraph;
 use ratatui::widgets::Scrollbar;
 use ratatui::widgets::ScrollbarOrientation;
 use ratatui::widgets::ScrollbarState;
+use tui_textarea::TextArea;
 use tui_tree_widget::Tree;
 use tui_tree_widget::TreeItem;
 use tui_tree_widget::TreeState;
 
 use crate::library::SnippetLibrary;
 use crate::model::SourceRoot;
-use crate::settings::format_settings;
+use crate::settings::SettingsCollection;
+use crate::settings::SettingsLineMap;
+use crate::settings::format_settings_with_map;
 
 pub type TreeId = String;
 
@@ -54,6 +59,7 @@ pub enum Mode {
     TitleInput,
     LibraryBrowse,
     RenameInput,
+    Edit,
 }
 
 #[derive(Debug)]
@@ -152,6 +158,7 @@ impl ContentState {
 #[derive(Debug, Default)]
 pub struct SettingsState {
     pub lines: Vec<String>,
+    pub line_map: SettingsLineMap,
     pub scroll: u16,
     pub cursor: usize,
     pub viewport_height: u16,
@@ -201,6 +208,46 @@ impl SettingsState {
     }
 }
 
+/// State for the text editor when in `Mode::Edit`.
+pub struct EditState {
+    pub textarea: TextArea<'static>,
+    pub file_path: PathBuf,
+    pub original_text: String,
+    pub had_trailing_newline: bool,
+    pub discard_confirmed: bool,
+    /// Cached dirty flag. `None` means the cache is stale and must be recomputed.
+    /// Using `Cell` allows `is_dirty()` to keep `&self` (needed for Debug and draw).
+    dirty_cache: Cell<Option<bool>>,
+}
+
+impl std::fmt::Debug for EditState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EditState")
+            .field("file_path", &self.file_path)
+            .field("is_dirty", &self.is_dirty())
+            .field("discard_confirmed", &self.discard_confirmed)
+            .finish()
+    }
+}
+
+impl EditState {
+    /// Returns true if the textarea content differs from the original text.
+    /// Uses an internal cache to avoid re-joining lines on every render frame.
+    pub fn is_dirty(&self) -> bool {
+        if let Some(cached) = self.dirty_cache.get() {
+            return cached;
+        }
+        let dirty = self.textarea.lines().join("\n") != self.original_text;
+        self.dirty_cache.set(Some(dirty));
+        dirty
+    }
+
+    /// Invalidate the dirty cache. Must be called after any textarea mutation.
+    pub fn invalidate_dirty_cache(&self) {
+        self.dirty_cache.set(None);
+    }
+}
+
 #[derive(Debug)]
 pub struct App {
     pub exit: bool,
@@ -216,6 +263,8 @@ pub struct App {
     pub library: Option<SnippetLibrary>,
     pub library_selected: usize,
     pub settings_state: SettingsState,
+    pub settings_collection: Option<SettingsCollection>,
+    pub edit_state: Option<EditState>,
 }
 
 impl App {
@@ -257,6 +306,8 @@ impl App {
             library: None,
             library_selected: 0,
             settings_state: SettingsState::default(),
+            settings_collection: None,
+            edit_state: None,
         };
 
         app.load_selected_content();
@@ -280,10 +331,14 @@ impl App {
         let sep = Span::styled("  ", desc_style);
 
         let pairs: Vec<(&str, &str)> = match self.screen {
+            Screen::Settings if self.mode == Mode::Edit => {
+                vec![("Ctrl+S", "Save"), ("Esc", "Cancel")]
+            }
             Screen::Settings => {
                 vec![
                     ("1", "Files"),
                     ("2", "Settings"),
+                    ("e", "Edit"),
                     ("j/k", "Scroll"),
                     ("q", "Quit"),
                 ]
@@ -296,6 +351,7 @@ impl App {
                         ("q", "Quit"),
                         ("Tab", "Files"),
                         ("j/k", "Scroll"),
+                        ("e", "Edit"),
                         ("v", "Select"),
                         ("L", "Library"),
                     ]
@@ -326,6 +382,9 @@ impl App {
                 }
                 Mode::RenameInput => {
                     vec![("Enter", "Save"), ("Esc", "Cancel")]
+                }
+                Mode::Edit => {
+                    vec![("Ctrl+S", "Save"), ("Esc", "Cancel")]
                 }
             },
         };
@@ -428,6 +487,12 @@ impl App {
     }
 
     fn draw_files_screen(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        // In edit mode, render the full area as an editor
+        if self.mode == Mode::Edit {
+            self.draw_edit_pane(frame, area);
+            return;
+        }
+
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
@@ -465,6 +530,11 @@ impl App {
     }
 
     fn draw_settings_screen(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        if self.mode == Mode::Edit {
+            self.draw_edit_pane(frame, area);
+            return;
+        }
+
         self.settings_state.viewport_height = area.height.saturating_sub(2);
 
         let cursor_line = self.settings_state.cursor;
@@ -635,6 +705,39 @@ impl App {
         frame.render_widget(preview_widget, lib_split[1]);
     }
 
+    fn draw_edit_pane(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
+        // Use take()/put-back pattern for the mutable borrow
+        let mut edit = match self.edit_state.take() {
+            Some(e) => e,
+            None => return,
+        };
+
+        // Show full path for settings files, just filename for CLAUDE.md
+        let display_name = if self.screen == Screen::Settings {
+            edit.file_path.display().to_string()
+        } else {
+            edit.file_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| edit.file_path.display().to_string())
+        };
+
+        let dirty_marker = if edit.is_dirty() { " [*]" } else { "" };
+        let title = format!("Edit: {display_name}{dirty_marker}");
+
+        edit.textarea.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(title),
+        );
+
+        frame.render_widget(&edit.textarea, area);
+
+        // Put back
+        self.edit_state = Some(edit);
+    }
+
     fn select_tree_item(&mut self) {
         let selected = self.tree_state.selected();
         if selected.is_empty() {
@@ -684,23 +787,229 @@ impl App {
     /// Switch to settings screen using an explicit project path (for testability).
     pub fn switch_to_settings_from(&mut self, project: &Path) {
         let collection = crate::settings::discover_settings_files(project);
-        self.settings_state.lines = format_settings(&collection);
-        self.settings_state.scroll = 0;
-        self.settings_state.cursor = 0;
+        self.apply_settings_collection(collection);
         self.screen = Screen::Settings;
     }
 
     /// Switch to settings screen with a pre-built collection (for testability).
     #[cfg(test)]
-    pub fn switch_to_settings_with(&mut self, collection: &crate::settings::SettingsCollection) {
-        self.settings_state.lines = format_settings(collection);
+    pub fn switch_to_settings_with(&mut self, collection: &SettingsCollection) {
+        self.apply_settings_collection(collection.clone());
+        self.screen = Screen::Settings;
+    }
+
+    fn apply_settings_collection(&mut self, collection: SettingsCollection) {
+        let (lines, line_map) = format_settings_with_map(&collection);
+        self.settings_state.lines = lines;
+        self.settings_state.line_map = line_map;
         self.settings_state.scroll = 0;
         self.settings_state.cursor = 0;
-        self.screen = Screen::Settings;
+        self.settings_collection = Some(collection);
+    }
+
+    /// Returns the file path of the settings file at the current cursor position.
+    pub fn settings_file_at_cursor(&self) -> Option<&Path> {
+        let file_idx = self
+            .settings_state
+            .line_map
+            .get(self.settings_state.cursor)
+            .copied()
+            .flatten()?;
+        let collection = self.settings_collection.as_ref()?;
+        let file = collection.files.get(file_idx)?;
+        Some(&file.path)
+    }
+
+    fn enter_edit_mode(&mut self) {
+        let selected = self.tree_state.selected();
+        if selected.len() < 2 {
+            return;
+        }
+        let path_str = match selected.last() {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        let path = PathBuf::from(&path_str);
+        self.enter_edit_mode_for(&path);
+    }
+
+    /// Maximum file size (in bytes) allowed for editing. Files larger than this
+    /// are rejected to prevent excessive memory usage.
+    const MAX_EDIT_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+
+    /// Enter edit mode for a specific file path. Extracted for testability.
+    pub fn enter_edit_mode_for(&mut self, path: &Path) {
+        // Guard against very large files to prevent OOM
+        match fs::metadata(path) {
+            Ok(meta) if meta.len() > Self::MAX_EDIT_FILE_SIZE => {
+                let size_mb = meta.len() as f64 / (1024.0 * 1024.0);
+                self.status_message = Some(format!(
+                    "File too large to edit ({size_mb:.1} MB, max 10 MB)"
+                ));
+                return;
+            }
+            Err(err) => {
+                self.status_message = Some(format!("Cannot open for editing: {err}"));
+                return;
+            }
+            _ => {}
+        }
+
+        let raw = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) => {
+                self.status_message = Some(format!("Cannot open for editing: {err}"));
+                return;
+            }
+        };
+
+        let had_trailing_newline = raw.ends_with('\n');
+        let text = if had_trailing_newline {
+            raw.strip_suffix('\n').unwrap_or(&raw).to_string()
+        } else {
+            raw
+        };
+
+        let lines: Vec<String> = text.lines().map(String::from).collect();
+        let lines = if lines.is_empty() {
+            vec![String::new()]
+        } else {
+            lines
+        };
+
+        let mut textarea = TextArea::new(lines);
+        textarea.set_tab_length(4);
+        textarea.set_cursor_line_style(Style::default().add_modifier(Modifier::UNDERLINED));
+
+        self.edit_state = Some(EditState {
+            textarea,
+            file_path: path.to_path_buf(),
+            original_text: text,
+            had_trailing_newline,
+            discard_confirmed: false,
+            dirty_cache: Cell::new(Some(false)),
+        });
+        self.mode = Mode::Edit;
+    }
+
+    fn handle_edit_key(&mut self, key_event: KeyEvent) {
+        match key_event.code {
+            KeyCode::Char('s') if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.save_edit();
+            }
+            KeyCode::Esc => {
+                self.exit_edit_mode();
+            }
+            _ => {
+                // Forward all other keys to the textarea
+                if let Some(edit) = &mut self.edit_state {
+                    edit.textarea.input(key_event);
+                    edit.invalidate_dirty_cache();
+                    // Any non-Esc key resets the discard confirmation
+                    edit.discard_confirmed = false;
+                }
+            }
+        }
+    }
+
+    fn save_edit(&mut self) {
+        let Some(edit) = &self.edit_state else {
+            return;
+        };
+        let path = edit.file_path.clone();
+        self.save_edit_to(&path);
+    }
+
+    /// Save the current edit to a specific path. Extracted for testability.
+    pub fn save_edit_to(&mut self, path: &Path) {
+        let Some(edit) = &mut self.edit_state else {
+            return;
+        };
+
+        let joined = edit.textarea.lines().join("\n");
+        let write_content = if edit.had_trailing_newline {
+            format!("{joined}\n")
+        } else {
+            joined.clone()
+        };
+
+        // Atomic write: write to temp file in the same directory, then rename.
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let result = tempfile::NamedTempFile::new_in(parent).and_then(|mut tmp| {
+            tmp.write_all(write_content.as_bytes())?;
+            tmp.flush()?;
+            tmp.persist(path).map_err(|e| e.error)?;
+            Ok(())
+        });
+
+        match result {
+            Ok(()) => {
+                // Update original_text so the dirty flag clears
+                edit.original_text = joined;
+                edit.dirty_cache.set(Some(false));
+                self.status_message = Some("Saved.".to_string());
+            }
+            Err(err) => {
+                self.status_message = Some(format!("Save failed: {err}"));
+            }
+        }
+    }
+
+    fn exit_edit_mode(&mut self) {
+        let Some(edit) = &mut self.edit_state else {
+            self.finalize_exit_edit();
+            return;
+        };
+
+        if edit.is_dirty() && !edit.discard_confirmed {
+            edit.discard_confirmed = true;
+            self.status_message =
+                Some("You have unsaved changes. Press Esc again to discard.".to_string());
+            return;
+        }
+
+        self.finalize_exit_edit();
+    }
+
+    fn finalize_exit_edit(&mut self) {
+        // Reload content into the read-only viewer if on Files screen
+        if self.screen == Screen::Files
+            && let Some(edit) = &self.edit_state
+        {
+            self.load_file_content(&edit.file_path.clone());
+        }
+
+        // If on Settings screen, refresh the formatted view
+        if self.screen == Screen::Settings {
+            self.refresh_settings();
+        }
+
+        self.edit_state = None;
+        self.mode = Mode::Normal;
+    }
+
+    fn refresh_settings(&mut self) {
+        let project = std::env::current_dir().unwrap_or_default();
+        let collection = crate::settings::discover_settings_files(&project);
+        self.apply_settings_collection(collection);
+    }
+
+    fn enter_settings_edit_mode(&mut self) {
+        let path = match self.settings_file_at_cursor() {
+            Some(p) => p.to_path_buf(),
+            None => {
+                self.status_message = Some("No settings file at cursor.".to_string());
+                return;
+            }
+        };
+        self.enter_edit_mode_for(&path);
     }
 
     fn handle_settings_key(&mut self, key_event: KeyEvent) {
         match key_event.code {
+            KeyCode::Char('e') => {
+                self.enter_settings_edit_mode();
+            }
             KeyCode::Char('q') => self.exit = true,
             KeyCode::Down | KeyCode::Char('j') => {
                 self.settings_state.cursor_down();
@@ -760,6 +1069,12 @@ impl App {
             }
         }
 
+        // Edit mode handles its own keys regardless of screen
+        if self.mode == Mode::Edit {
+            self.handle_edit_key(key_event);
+            return;
+        }
+
         match self.screen {
             Screen::Files => match self.mode {
                 Mode::Normal => self.handle_normal_key(key_event),
@@ -767,6 +1082,7 @@ impl App {
                 Mode::TitleInput => self.handle_title_input_key(key_event),
                 Mode::LibraryBrowse => self.handle_library_browse_key(key_event),
                 Mode::RenameInput => self.handle_rename_input_key(key_event),
+                Mode::Edit => {} // handled above
             },
             Screen::Settings => self.handle_settings_key(key_event),
         }
@@ -815,6 +1131,9 @@ impl App {
             KeyCode::Char('v') if self.active_pane == Pane::Content => {
                 self.content.visual_anchor = Some(self.content.cursor);
                 self.mode = Mode::VisualSelect;
+            }
+            KeyCode::Char('e') if self.active_pane == Pane::Content => {
+                self.enter_edit_mode();
             }
             KeyCode::Char('L') if self.active_pane == Pane::Content => {
                 self.enter_library_browse();
@@ -1552,6 +1871,7 @@ mod tests {
             Mode::TitleInput,
             Mode::LibraryBrowse,
             Mode::RenameInput,
+            Mode::Edit,
         ] {
             let mut app = App::new(vec![]);
             app.mode = mode;
@@ -2119,5 +2439,504 @@ mod tests {
 
         app.handle_key_event(key_event(KeyCode::Char('k')));
         assert_eq!(app.settings_state.cursor, 1);
+    }
+
+    // --- Edit mode tests ---
+
+    #[test]
+    fn edit_state_starts_as_none() {
+        let app = App::new(vec![]);
+        assert!(app.edit_state.is_none());
+    }
+
+    #[test]
+    fn ctrl_c_exits_from_edit_mode() {
+        let mut app = App::new(vec![]);
+        app.mode = Mode::Edit;
+        app.handle_key_event(KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        });
+        assert!(app.exit, "Ctrl-C should exit from edit mode");
+    }
+
+    #[test]
+    fn edit_state_is_dirty_detects_changes() {
+        let original = "line 1\nline 2".to_string();
+        let textarea = TextArea::from(["line 1", "line 2"]);
+        let state = EditState {
+            textarea,
+            file_path: PathBuf::from("/test/file.md"),
+            original_text: original,
+            had_trailing_newline: false,
+            discard_confirmed: false,
+            dirty_cache: Cell::new(None),
+        };
+        assert!(!state.is_dirty(), "Unmodified textarea should not be dirty");
+
+        let modified_textarea = TextArea::from(["line 1", "line 2 modified"]);
+        let state2 = EditState {
+            textarea: modified_textarea,
+            file_path: PathBuf::from("/test/file.md"),
+            original_text: "line 1\nline 2".to_string(),
+            had_trailing_newline: false,
+            discard_confirmed: false,
+            dirty_cache: Cell::new(None),
+        };
+        assert!(state2.is_dirty(), "Modified textarea should be dirty");
+    }
+
+    #[test]
+    fn e_in_content_pane_enters_edit_mode() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("CLAUDE.md");
+        fs::write(&file, "Hello world").unwrap();
+
+        let roots = vec![SourceRoot {
+            path: tmp.path().to_path_buf(),
+            files: vec![file],
+        }];
+        let mut app = App::new(roots);
+        app.active_pane = Pane::Content;
+
+        app.handle_key_event(key_event(KeyCode::Char('e')));
+
+        assert_eq!(app.mode, Mode::Edit);
+        assert!(app.edit_state.is_some());
+        let edit = app.edit_state.as_ref().unwrap();
+        assert_eq!(edit.textarea.lines().join("\n"), "Hello world");
+        assert!(!edit.is_dirty());
+    }
+
+    #[test]
+    fn edit_mode_renders_without_panic() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("CLAUDE.md");
+        fs::write(&file, "Line 1\nLine 2\nLine 3").unwrap();
+
+        let roots = vec![SourceRoot {
+            path: tmp.path().to_path_buf(),
+            files: vec![file],
+        }];
+        let mut app = App::new(roots);
+        app.active_pane = Pane::Content;
+        app.handle_key_event(key_event(KeyCode::Char('e')));
+        assert_eq!(app.mode, Mode::Edit);
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        // If we get here without panic, the test passes
+    }
+
+    #[test]
+    fn e_in_file_list_does_not_enter_edit() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("CLAUDE.md");
+        fs::write(&file, "Hello").unwrap();
+
+        let roots = vec![SourceRoot {
+            path: tmp.path().to_path_buf(),
+            files: vec![file],
+        }];
+        let mut app = App::new(roots);
+        app.active_pane = Pane::FileList;
+
+        app.handle_key_event(key_event(KeyCode::Char('e')));
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.edit_state.is_none());
+    }
+
+    #[test]
+    fn typing_in_edit_mode_modifies_textarea() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("CLAUDE.md");
+        fs::write(&file, "Hello").unwrap();
+
+        let mut app = App::new(vec![]);
+        app.enter_edit_mode_for(&file);
+        assert_eq!(app.mode, Mode::Edit);
+
+        // Type a character
+        app.handle_key_event(key_event(KeyCode::Char('X')));
+
+        let edit = app.edit_state.as_ref().unwrap();
+        let content = edit.textarea.lines().join("\n");
+        assert!(content.contains('X'), "Typed char should appear: {content}");
+        assert!(edit.is_dirty());
+    }
+
+    #[test]
+    fn ctrl_s_saves_file_to_disk() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("CLAUDE.md");
+        fs::write(&file, "original").unwrap();
+
+        let mut app = App::new(vec![]);
+        app.enter_edit_mode_for(&file);
+
+        // Type something
+        app.handle_key_event(key_event(KeyCode::Char('!')));
+
+        // Save with Ctrl+S
+        app.handle_key_event(KeyEvent {
+            code: KeyCode::Char('s'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        });
+
+        let saved = fs::read_to_string(&file).unwrap();
+        assert!(
+            saved.contains('!'),
+            "File should contain typed char: {saved}"
+        );
+        assert!(app.status_message.as_deref().unwrap().contains("Saved"));
+
+        // Should still be in edit mode after save
+        assert_eq!(app.mode, Mode::Edit);
+        // But no longer dirty
+        assert!(
+            !app.edit_state.as_ref().unwrap().is_dirty(),
+            "After save, should not be dirty"
+        );
+    }
+
+    #[test]
+    fn esc_on_clean_edit_returns_to_normal() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("CLAUDE.md");
+        fs::write(&file, "clean").unwrap();
+
+        let mut app = App::new(vec![]);
+        app.enter_edit_mode_for(&file);
+
+        // Esc with no changes should exit edit mode
+        app.handle_key_event(key_event(KeyCode::Esc));
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.edit_state.is_none());
+    }
+
+    #[test]
+    fn esc_on_dirty_edit_warns_does_not_exit() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("CLAUDE.md");
+        fs::write(&file, "original").unwrap();
+
+        let mut app = App::new(vec![]);
+        app.enter_edit_mode_for(&file);
+        app.handle_key_event(key_event(KeyCode::Char('X')));
+
+        // First Esc: warns but doesn't exit
+        app.handle_key_event(key_event(KeyCode::Esc));
+
+        assert_eq!(app.mode, Mode::Edit, "Should still be in edit mode");
+        assert!(
+            app.status_message.as_deref().unwrap().contains("unsaved"),
+            "Should show unsaved warning"
+        );
+    }
+
+    #[test]
+    fn double_esc_discards_unsaved_changes() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("CLAUDE.md");
+        fs::write(&file, "original").unwrap();
+
+        let mut app = App::new(vec![]);
+        app.enter_edit_mode_for(&file);
+        app.handle_key_event(key_event(KeyCode::Char('X')));
+
+        // First Esc: warns
+        app.handle_key_event(key_event(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Edit);
+
+        // Second Esc: discards
+        app.handle_key_event(key_event(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.edit_state.is_none());
+
+        // File should be unchanged
+        let content = fs::read_to_string(&file).unwrap();
+        assert_eq!(content, "original");
+    }
+
+    #[test]
+    fn typing_after_first_esc_resets_discard_flag() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("CLAUDE.md");
+        fs::write(&file, "original").unwrap();
+
+        let mut app = App::new(vec![]);
+        app.enter_edit_mode_for(&file);
+        app.handle_key_event(key_event(KeyCode::Char('X')));
+
+        // First Esc: warns
+        app.handle_key_event(key_event(KeyCode::Esc));
+        assert!(app.edit_state.as_ref().unwrap().discard_confirmed);
+
+        // Type something: resets discard flag
+        app.handle_key_event(key_event(KeyCode::Char('Y')));
+        assert!(!app.edit_state.as_ref().unwrap().discard_confirmed);
+
+        // Now Esc again should warn, not discard
+        app.handle_key_event(key_event(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Edit, "Should still be in edit mode");
+    }
+
+    #[test]
+    fn help_line_shows_edit_key_in_content_pane() {
+        let mut app = App::new(vec![]);
+        app.active_pane = Pane::Content;
+        app.mode = Mode::Normal;
+        let help = app.help_line();
+        let help_text: String = help.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(
+            help_text.contains("Edit"),
+            "Help line should show Edit in content pane: {help_text}"
+        );
+    }
+
+    #[test]
+    fn help_line_shows_edit_key_on_settings_screen() {
+        let mut app = App::new(vec![]);
+        app.screen = Screen::Settings;
+        let help = app.help_line();
+        let help_text: String = help.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(
+            help_text.contains("Edit"),
+            "Help line should show Edit on settings screen: {help_text}"
+        );
+    }
+
+    #[test]
+    fn help_line_shows_save_cancel_in_edit_mode() {
+        let mut app = App::new(vec![]);
+        app.mode = Mode::Edit;
+        let help = app.help_line();
+        let help_text: String = help.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(
+            help_text.contains("Save") && help_text.contains("Cancel"),
+            "Help line should show Save and Cancel in edit mode: {help_text}"
+        );
+    }
+
+    #[test]
+    fn e_on_settings_screen_enters_edit_for_settings_file() {
+        let tmp = TempDir::new().unwrap();
+        let settings_dir = tmp.path().join(".claude");
+        fs::create_dir_all(&settings_dir).unwrap();
+        let settings_file = settings_dir.join("settings.json");
+        fs::write(&settings_file, r#"{"model":"opus"}"#).unwrap();
+
+        let collection = crate::settings::SettingsCollection {
+            files: vec![crate::settings::SettingsFile {
+                label: "Test".to_string(),
+                path: settings_file.clone(),
+                value: serde_json::json!({"model": "opus"}),
+            }],
+        };
+
+        let mut app = App::new(vec![]);
+        app.switch_to_settings_with(&collection);
+        app.settings_state.cursor = 0; // on the header line of the file
+
+        app.handle_key_event(key_event(KeyCode::Char('e')));
+
+        assert_eq!(app.mode, Mode::Edit);
+        assert!(app.edit_state.is_some());
+        let edit = app.edit_state.as_ref().unwrap();
+        assert_eq!(edit.file_path, settings_file);
+    }
+
+    #[test]
+    fn exiting_settings_edit_refreshes_formatted_view() {
+        let tmp = TempDir::new().unwrap();
+        let settings_dir = tmp.path().join(".claude");
+        fs::create_dir_all(&settings_dir).unwrap();
+        let settings_file = settings_dir.join("settings.json");
+        fs::write(&settings_file, r#"{"model":"opus"}"#).unwrap();
+
+        let mut app = App::new(vec![]);
+        app.enter_edit_mode_for(&settings_file);
+        app.screen = Screen::Settings;
+        assert_eq!(app.mode, Mode::Edit);
+
+        // Exit without changes
+        app.handle_key_event(key_event(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.edit_state.is_none());
+    }
+
+    #[test]
+    fn settings_file_at_cursor_resolves_path() {
+        let mut app = App::new(vec![]);
+        let collection = crate::settings::SettingsCollection {
+            files: vec![
+                crate::settings::SettingsFile {
+                    label: "Global".to_string(),
+                    path: PathBuf::from("/home/.claude/settings.json"),
+                    value: serde_json::json!({"model": "opus"}),
+                },
+                crate::settings::SettingsFile {
+                    label: "Project".to_string(),
+                    path: PathBuf::from("/proj/.claude/settings.json"),
+                    value: serde_json::json!({"defaultMode": "plan"}),
+                },
+            ],
+        };
+        app.switch_to_settings_with(&collection);
+
+        // Cursor at 0 should be the Global file header
+        app.settings_state.cursor = 0;
+        assert_eq!(
+            app.settings_file_at_cursor(),
+            Some(Path::new("/home/.claude/settings.json"))
+        );
+
+        // Find a line from the second file
+        let second_file_line = app
+            .settings_state
+            .line_map
+            .iter()
+            .position(|m| *m == Some(1))
+            .unwrap();
+        app.settings_state.cursor = second_file_line;
+        assert_eq!(
+            app.settings_file_at_cursor(),
+            Some(Path::new("/proj/.claude/settings.json"))
+        );
+    }
+
+    #[test]
+    fn q_in_edit_mode_types_q_not_exit() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("CLAUDE.md");
+        fs::write(&file, "Hello").unwrap();
+
+        let mut app = App::new(vec![]);
+        app.enter_edit_mode_for(&file);
+
+        app.handle_key_event(key_event(KeyCode::Char('q')));
+
+        assert!(!app.exit, "q should not exit in edit mode");
+        assert_eq!(app.mode, Mode::Edit);
+        let edit = app.edit_state.as_ref().unwrap();
+        let content = edit.textarea.lines().join("\n");
+        assert!(content.contains('q'), "q should be typed into editor");
+    }
+
+    #[test]
+    fn enter_edit_mode_for_nonexistent_file_stays_normal() {
+        let mut app = App::new(vec![]);
+        app.enter_edit_mode_for(Path::new("/nonexistent/CLAUDE.md"));
+
+        assert_eq!(app.mode, Mode::Normal, "Should stay in Normal mode");
+        assert!(app.edit_state.is_none(), "No edit state should be created");
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("Cannot open"),
+            "Should show error message, got: {:?}",
+            app.status_message
+        );
+    }
+
+    #[test]
+    fn e_on_blank_separator_in_settings_shows_error() {
+        let mut app = App::new(vec![]);
+        let collection = crate::settings::SettingsCollection {
+            files: vec![
+                crate::settings::SettingsFile {
+                    label: "Global".to_string(),
+                    path: PathBuf::from("/home/.claude/settings.json"),
+                    value: serde_json::json!({"model": "opus"}),
+                },
+                crate::settings::SettingsFile {
+                    label: "Project".to_string(),
+                    path: PathBuf::from("/proj/.claude/settings.json"),
+                    value: serde_json::json!({"defaultMode": "plan"}),
+                },
+            ],
+        };
+        app.switch_to_settings_with(&collection);
+
+        // Find the blank separator line (maps to None)
+        let blank_idx = app
+            .settings_state
+            .line_map
+            .iter()
+            .position(|m| m.is_none())
+            .unwrap();
+        app.settings_state.cursor = blank_idx;
+
+        app.handle_key_event(key_event(KeyCode::Char('e')));
+
+        assert_eq!(app.mode, Mode::Normal, "Should stay in Normal mode");
+        assert!(app.edit_state.is_none());
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("No settings file"),
+            "Should show no-file message, got: {:?}",
+            app.status_message
+        );
+    }
+
+    #[test]
+    fn trailing_newline_preserved_after_edit_save_cycle() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("CLAUDE.md");
+        let original_content = "Line 1\nLine 2\n";
+        fs::write(&file, original_content).unwrap();
+
+        let mut app = App::new(vec![]);
+        app.enter_edit_mode_for(&file);
+        assert_eq!(app.mode, Mode::Edit);
+
+        // Save without making changes
+        app.handle_key_event(KeyEvent {
+            code: KeyCode::Char('s'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        });
+
+        let saved = fs::read_to_string(&file).unwrap();
+        assert_eq!(
+            saved, original_content,
+            "File should be byte-for-byte identical after no-op save"
+        );
+    }
+
+    #[test]
+    fn no_trailing_newline_preserved_after_edit_save_cycle() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("CLAUDE.md");
+        let original_content = "Line 1\nLine 2";
+        fs::write(&file, original_content).unwrap();
+
+        let mut app = App::new(vec![]);
+        app.enter_edit_mode_for(&file);
+
+        // Save without making changes
+        app.handle_key_event(KeyEvent {
+            code: KeyCode::Char('s'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        });
+
+        let saved = fs::read_to_string(&file).unwrap();
+        assert_eq!(
+            saved, original_content,
+            "File without trailing newline should stay without one"
+        );
     }
 }

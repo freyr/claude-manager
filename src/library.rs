@@ -28,9 +28,7 @@ pub fn library_path() -> Option<PathBuf> {
 }
 
 pub fn library_path_in(home: &Path) -> PathBuf {
-    home.join(".config")
-        .join("jigolo")
-        .join("library.toml")
+    home.join(".config").join("jigolo").join("library.toml")
 }
 
 pub fn load_library(path: &Path) -> Result<SnippetLibrary> {

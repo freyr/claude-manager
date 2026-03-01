@@ -2,14 +2,14 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SettingsFile {
     pub label: String,
     pub path: PathBuf,
     pub value: serde_json::Value,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SettingsCollection {
     pub files: Vec<SettingsFile>,
 }
@@ -66,21 +66,29 @@ fn load_settings_file(label: &str, path: &Path) -> Option<SettingsFile> {
     })
 }
 
-/// Format settings collection into display lines for the TUI.
-pub fn format_settings(collection: &SettingsCollection) -> Vec<String> {
+/// Maps each display line index to the index of the source `SettingsFile`.
+/// Blank separator lines map to `None`.
+pub type SettingsLineMap = Vec<Option<usize>>;
+
+/// Format settings collection into display lines and a line-to-file mapping.
+pub fn format_settings_with_map(collection: &SettingsCollection) -> (Vec<String>, SettingsLineMap) {
     let mut lines = Vec::new();
+    let mut line_map = Vec::new();
 
     for (i, file) in collection.files.iter().enumerate() {
         if i > 0 {
             lines.push(String::new());
+            line_map.push(None); // blank separator
         }
 
         // Section header
         lines.push(format!("▾ {} ({})", file.label, file.path.display()));
+        line_map.push(Some(i));
 
         // If the value is an error string, just show it
         if let serde_json::Value::String(s) = &file.value {
             lines.push(format!("  {s}"));
+            line_map.push(Some(i));
             continue;
         }
 
@@ -88,11 +96,11 @@ pub fn format_settings(collection: &SettingsCollection) -> Vec<String> {
             Some(obj) => obj,
             None => {
                 lines.push("  (not a JSON object)".to_string());
+                line_map.push(Some(i));
                 continue;
             }
         };
 
-        // Display in a specific order, then catch remaining keys
         let ordered_keys = [
             "model",
             "defaultMode",
@@ -104,20 +112,29 @@ pub fn format_settings(collection: &SettingsCollection) -> Vec<String> {
             "env",
         ];
 
+        let before = lines.len();
         for &key in &ordered_keys {
             if let Some(val) = obj.get(key) {
                 format_key_value(key, val, &mut lines);
             }
         }
-
-        // Remaining keys not in the ordered list
         for (key, val) in obj {
             if !ordered_keys.contains(&key.as_str()) {
                 format_key_value(key, val, &mut lines);
             }
         }
+        let added = lines.len() - before;
+        for _ in 0..added {
+            line_map.push(Some(i));
+        }
     }
 
+    (lines, line_map)
+}
+
+/// Format settings collection into display lines for the TUI.
+pub fn format_settings(collection: &SettingsCollection) -> Vec<String> {
+    let (lines, _) = format_settings_with_map(collection);
     lines
 }
 
@@ -472,6 +489,38 @@ mod tests {
             blank_before_second.is_empty(),
             "Should have blank separator line"
         );
+    }
+
+    #[test]
+    fn line_map_maps_lines_to_correct_files() {
+        let collection = SettingsCollection {
+            files: vec![
+                SettingsFile {
+                    label: "Global".to_string(),
+                    path: PathBuf::from("/home/.claude/settings.json"),
+                    value: serde_json::json!({"model": "opus"}),
+                },
+                SettingsFile {
+                    label: "Project".to_string(),
+                    path: PathBuf::from("/project/.claude/settings.json"),
+                    value: serde_json::json!({"defaultMode": "plan"}),
+                },
+            ],
+        };
+
+        let (lines, line_map) = format_settings_with_map(&collection);
+
+        assert_eq!(lines.len(), line_map.len(), "Lines and map should match");
+
+        // First file header should map to file index 0
+        assert_eq!(line_map[0], Some(0));
+
+        // Find the blank separator
+        let blank_idx = lines.iter().position(|l| l.is_empty()).unwrap();
+        assert_eq!(line_map[blank_idx], None, "Blank separator maps to None");
+
+        // Line after separator should map to file index 1
+        assert_eq!(line_map[blank_idx + 1], Some(1));
     }
 
     /// Helper: create a SettingsCollection from a single JSON string.
