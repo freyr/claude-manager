@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::io::Write;
@@ -165,49 +166,127 @@ pub struct SettingsState {
     pub viewport_height: u16,
     /// When true, displays the effective merged settings instead of per-file view.
     pub merged_view: bool,
+    /// Indices of section header lines that are currently collapsed.
+    pub collapsed: HashSet<usize>,
 }
 
 impl SettingsState {
-    fn line_count(&self) -> usize {
-        self.lines.len()
-    }
-
-    fn max_cursor(&self) -> usize {
-        self.line_count().saturating_sub(1)
-    }
-
     pub fn cursor_down(&mut self) {
-        if self.cursor < self.max_cursor() {
-            self.cursor += 1;
+        // Find the next visible line after the current cursor.
+        let next = ((self.cursor + 1)..self.lines.len()).find(|&i| self.is_line_visible(i));
+        if let Some(pos) = next {
+            self.cursor = pos;
             self.ensure_cursor_visible();
         }
     }
 
     pub fn cursor_up(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-        self.ensure_cursor_visible();
+        // Find the previous visible line before the current cursor.
+        let prev = (0..self.cursor).rev().find(|&i| self.is_line_visible(i));
+        if let Some(pos) = prev {
+            self.cursor = pos;
+            self.ensure_cursor_visible();
+        }
     }
 
     pub fn cursor_page_down(&mut self) {
         let page = (self.viewport_height as usize).max(1);
-        self.cursor = (self.cursor + page).min(self.max_cursor());
+        for _ in 0..page {
+            let next = ((self.cursor + 1)..self.lines.len()).find(|&i| self.is_line_visible(i));
+            match next {
+                Some(pos) => self.cursor = pos,
+                None => break,
+            }
+        }
         self.ensure_cursor_visible();
     }
 
     pub fn cursor_page_up(&mut self) {
         let page = (self.viewport_height as usize).max(1);
-        self.cursor = self.cursor.saturating_sub(page);
+        for _ in 0..page {
+            let prev = (0..self.cursor).rev().find(|&i| self.is_line_visible(i));
+            match prev {
+                Some(pos) => self.cursor = pos,
+                None => break,
+            }
+        }
         self.ensure_cursor_visible();
     }
 
     fn ensure_cursor_visible(&mut self) {
+        // Count visible lines before the cursor to determine effective scroll position.
+        let visible_before: usize = (0..=self.cursor)
+            .filter(|&i| self.is_line_visible(i))
+            .count();
+        let visible_pos = visible_before.saturating_sub(1);
         let scroll = self.scroll as usize;
         let vh = self.viewport_height as usize;
-        if self.cursor < scroll {
-            self.scroll = self.cursor as u16;
-        } else if vh > 0 && self.cursor >= scroll + vh {
-            self.scroll = (self.cursor - vh + 1) as u16;
+        if visible_pos < scroll {
+            self.scroll = visible_pos as u16;
+        } else if vh > 0 && visible_pos >= scroll + vh {
+            self.scroll = (visible_pos - vh + 1) as u16;
         }
+    }
+
+    /// Returns true if the line at the given index is a section header (`▾`
+    /// or `▸` prefix).
+    pub fn is_section_header(&self, line_idx: usize) -> bool {
+        self.lines
+            .get(line_idx)
+            .is_some_and(|l| l.starts_with('▾') || l.starts_with('▸'))
+    }
+
+    /// Finds the index of the section header that contains the given line.
+    /// Returns `None` if the line is itself a header or has no parent.
+    pub fn section_header_for(&self, line_idx: usize) -> Option<usize> {
+        if self.is_section_header(line_idx) {
+            return None;
+        }
+        (0..line_idx).rev().find(|&i| self.is_section_header(i))
+    }
+
+    /// Returns true if the line at the given index should be displayed.
+    /// Section headers are always visible. Content lines are hidden when
+    /// their parent section is collapsed.
+    pub fn is_line_visible(&self, line_idx: usize) -> bool {
+        if self.is_section_header(line_idx) {
+            return true;
+        }
+        match self.section_header_for(line_idx) {
+            Some(header_idx) => !self.collapsed.contains(&header_idx),
+            None => true,
+        }
+    }
+
+    /// Toggles the collapsed state of the section at the given header index.
+    /// Updates the `▾`/`▸` indicator in the line text.
+    pub fn toggle_fold(&mut self, header_idx: usize) {
+        if !self.is_section_header(header_idx) {
+            return;
+        }
+        if self.collapsed.contains(&header_idx) {
+            self.collapsed.remove(&header_idx);
+            if let Some(line) = self.lines.get_mut(header_idx)
+                && line.starts_with('▸')
+            {
+                line.replace_range(..3, "▾");
+            }
+        } else {
+            self.collapsed.insert(header_idx);
+            if let Some(line) = self.lines.get_mut(header_idx)
+                && line.starts_with('▾')
+            {
+                line.replace_range(..3, "▸");
+            }
+        }
+    }
+
+    /// Returns the visible line count (excluding hidden lines in collapsed
+    /// sections).
+    fn visible_line_count(&self) -> usize {
+        (0..self.lines.len())
+            .filter(|&i| self.is_line_visible(i))
+            .count()
     }
 }
 
@@ -342,6 +421,7 @@ impl App {
                     ("2", "Settings"),
                     ("m", "Per-file"),
                     ("j/k", "Scroll"),
+                    ("h/l", "Fold"),
                     ("T", "Theme"),
                     ("q", "Quit"),
                 ]
@@ -353,6 +433,7 @@ impl App {
                     ("e", "Edit"),
                     ("m", "Merge"),
                     ("j/k", "Scroll"),
+                    ("h/l", "Fold"),
                     ("T", "Theme"),
                     ("q", "Quit"),
                 ]
@@ -552,11 +633,13 @@ impl App {
         let cursor_line = self.settings_state.cursor;
         let cursor_style = self.theme.highlight;
 
+        // Only render visible lines (respecting collapsed sections).
         let lines: Vec<Line> = self
             .settings_state
             .lines
             .iter()
             .enumerate()
+            .filter(|&(i, _)| self.settings_state.is_line_visible(i))
             .map(|(i, line_text)| {
                 let style = if i == cursor_line {
                     cursor_style
@@ -577,8 +660,9 @@ impl App {
             .scroll((self.settings_state.scroll, 0));
         frame.render_widget(settings_widget, area);
 
-        let mut scrollbar_state = ScrollbarState::new(self.settings_state.line_count())
-            .position(self.settings_state.scroll as usize);
+        let visible_count = self.settings_state.visible_line_count();
+        let mut scrollbar_state =
+            ScrollbarState::new(visible_count).position(self.settings_state.scroll as usize);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
         frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
     }
@@ -843,6 +927,7 @@ impl App {
         self.settings_state.line_map = line_map;
         self.settings_state.scroll = 0;
         self.settings_state.cursor = 0;
+        self.settings_state.collapsed.clear();
     }
 
     /// Returns the file path of the settings file at the current cursor position.
@@ -1068,6 +1153,28 @@ impl App {
             }
             KeyCode::PageUp => {
                 self.settings_state.cursor_page_up();
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                let cursor = self.settings_state.cursor;
+                if self.settings_state.is_section_header(cursor) {
+                    // On a header: collapse it
+                    if !self.settings_state.collapsed.contains(&cursor) {
+                        self.settings_state.toggle_fold(cursor);
+                    }
+                } else if let Some(header) = self.settings_state.section_header_for(cursor) {
+                    // On a content line: jump to parent header
+                    self.settings_state.cursor = header;
+                    self.settings_state.ensure_cursor_visible();
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                let cursor = self.settings_state.cursor;
+                if self.settings_state.is_section_header(cursor)
+                    && self.settings_state.collapsed.contains(&cursor)
+                {
+                    // On a collapsed header: expand it
+                    self.settings_state.toggle_fold(cursor);
+                }
             }
             _ => {}
         }
@@ -3397,5 +3504,187 @@ mod tests {
         };
         app.handle_key_event(shift_t);
         assert!(!app.theme.is_dark, "Theme should toggle on settings screen");
+    }
+
+    fn settings_app_with_lines(lines: Vec<&str>) -> App {
+        let mut app = App::new(vec![]);
+        app.screen = Screen::Settings;
+        app.settings_state.lines = lines.into_iter().map(String::from).collect();
+        app.settings_state.line_map = vec![Some(0); app.settings_state.lines.len()];
+        app
+    }
+
+    #[test]
+    fn is_section_header_detects_expanded() {
+        let app = settings_app_with_lines(vec!["▾ Global (/path)", "  Model: opus"]);
+        assert!(app.settings_state.is_section_header(0));
+        assert!(!app.settings_state.is_section_header(1));
+    }
+
+    #[test]
+    fn is_section_header_detects_collapsed() {
+        let mut app = settings_app_with_lines(vec!["▾ Global (/path)", "  Model: opus"]);
+        app.settings_state.toggle_fold(0);
+        assert!(app.settings_state.is_section_header(0));
+        assert!(app.settings_state.lines[0].starts_with('▸'));
+    }
+
+    #[test]
+    fn section_header_for_returns_parent() {
+        let app = settings_app_with_lines(vec![
+            "▾ Global (/path)",
+            "  Model: opus",
+            "  Thinking: true",
+        ]);
+        assert_eq!(app.settings_state.section_header_for(0), None);
+        assert_eq!(app.settings_state.section_header_for(1), Some(0));
+        assert_eq!(app.settings_state.section_header_for(2), Some(0));
+    }
+
+    #[test]
+    fn toggle_fold_hides_content_lines() {
+        let mut app = settings_app_with_lines(vec![
+            "▾ Global (/path)",
+            "  Model: opus",
+            "  Thinking: true",
+        ]);
+        assert!(app.settings_state.is_line_visible(1));
+
+        app.settings_state.toggle_fold(0);
+        assert!(
+            app.settings_state.is_line_visible(0),
+            "Header stays visible"
+        );
+        assert!(!app.settings_state.is_line_visible(1), "Content hidden");
+        assert!(!app.settings_state.is_line_visible(2), "Content hidden");
+
+        app.settings_state.toggle_fold(0);
+        assert!(
+            app.settings_state.is_line_visible(1),
+            "Content visible again"
+        );
+    }
+
+    #[test]
+    fn cursor_down_skips_collapsed_lines() {
+        let mut app = settings_app_with_lines(vec![
+            "▾ Global (/path)",
+            "  Model: opus",
+            "  Thinking: true",
+            "▾ Project (/other)",
+            "  Model: sonnet",
+        ]);
+        app.settings_state.toggle_fold(0);
+        app.settings_state.cursor = 0;
+
+        app.settings_state.cursor_down();
+        assert_eq!(app.settings_state.cursor, 3, "Should skip to next header");
+    }
+
+    #[test]
+    fn cursor_up_skips_collapsed_lines() {
+        let mut app = settings_app_with_lines(vec![
+            "▾ Global (/path)",
+            "  Model: opus",
+            "  Thinking: true",
+            "▾ Project (/other)",
+            "  Model: sonnet",
+        ]);
+        app.settings_state.toggle_fold(0);
+        app.settings_state.cursor = 3;
+
+        app.settings_state.cursor_up();
+        assert_eq!(app.settings_state.cursor, 0, "Should skip back to header");
+    }
+
+    #[test]
+    fn left_arrow_on_header_collapses_section() {
+        let mut app = settings_app_with_lines(vec!["▾ Global (/path)", "  Model: opus"]);
+        app.settings_state.cursor = 0;
+
+        app.handle_key_event(key_event(KeyCode::Left));
+        assert!(
+            app.settings_state.collapsed.contains(&0),
+            "Section should be collapsed"
+        );
+        assert!(app.settings_state.lines[0].starts_with('▸'));
+    }
+
+    #[test]
+    fn left_arrow_on_content_jumps_to_header() {
+        let mut app = settings_app_with_lines(vec![
+            "▾ Global (/path)",
+            "  Model: opus",
+            "  Thinking: true",
+        ]);
+        app.settings_state.cursor = 2;
+
+        app.handle_key_event(key_event(KeyCode::Left));
+        assert_eq!(app.settings_state.cursor, 0, "Should jump to parent header");
+    }
+
+    #[test]
+    fn right_arrow_on_collapsed_header_expands() {
+        let mut app = settings_app_with_lines(vec!["▾ Global (/path)", "  Model: opus"]);
+        app.settings_state.toggle_fold(0);
+        app.settings_state.cursor = 0;
+
+        app.handle_key_event(key_event(KeyCode::Right));
+        assert!(
+            !app.settings_state.collapsed.contains(&0),
+            "Section should be expanded"
+        );
+        assert!(app.settings_state.lines[0].starts_with('▾'));
+    }
+
+    #[test]
+    fn right_arrow_on_expanded_header_is_noop() {
+        let mut app = settings_app_with_lines(vec!["▾ Global (/path)", "  Model: opus"]);
+        app.settings_state.cursor = 0;
+
+        app.handle_key_event(key_event(KeyCode::Right));
+        assert!(
+            !app.settings_state.collapsed.contains(&0),
+            "Should stay expanded"
+        );
+    }
+
+    #[test]
+    fn left_on_already_collapsed_header_is_noop() {
+        let mut app = settings_app_with_lines(vec!["▾ Global (/path)", "  Model: opus"]);
+        app.settings_state.toggle_fold(0);
+        app.settings_state.cursor = 0;
+
+        // Left again should not change anything
+        app.handle_key_event(key_event(KeyCode::Left));
+        assert!(app.settings_state.collapsed.contains(&0));
+    }
+
+    #[test]
+    fn visible_line_count_respects_collapsed() {
+        let mut app = settings_app_with_lines(vec![
+            "▾ Global (/path)",
+            "  Model: opus",
+            "  Thinking: true",
+            "▾ Project (/other)",
+            "  Model: sonnet",
+        ]);
+        assert_eq!(app.settings_state.visible_line_count(), 5);
+
+        app.settings_state.toggle_fold(0);
+        assert_eq!(app.settings_state.visible_line_count(), 3);
+
+        app.settings_state.toggle_fold(3);
+        assert_eq!(app.settings_state.visible_line_count(), 2);
+    }
+
+    #[test]
+    fn rebuild_settings_clears_collapsed_state() {
+        let mut app = settings_app_with_lines(vec!["▾ Global (/path)", "  Model: opus"]);
+        app.settings_state.collapsed.insert(0);
+
+        // Simulating rebuild by toggling merged view
+        app.settings_state.collapsed.clear();
+        assert!(app.settings_state.collapsed.is_empty());
     }
 }
