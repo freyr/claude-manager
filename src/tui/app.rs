@@ -1095,7 +1095,11 @@ impl App {
                 self.load_selected_content();
             }
             KeyCode::Left | KeyCode::Char('h') if self.active_pane == Pane::FileList => {
+                let before = self.tree_state.selected().to_vec();
                 self.tree_state.key_left();
+                if self.tree_state.selected().is_empty() {
+                    self.tree_state.select(before);
+                }
                 self.load_selected_content();
             }
             KeyCode::Right | KeyCode::Char('l') if self.active_pane == Pane::FileList => {
@@ -1567,6 +1571,36 @@ mod tests {
         assert!(
             app.content.text.is_none(),
             "Content should be cleared when folder is selected via Left"
+        );
+    }
+
+    #[test]
+    fn left_on_folder_node_does_not_lose_selection() {
+        let mut app = App::new(sample_roots());
+        render_once(&mut app);
+
+        // Navigate to the /a folder node
+        app.tree_state.select(vec!["/a".to_string()]);
+        assert_eq!(app.tree_state.selected().len(), 1);
+
+        // First Left closes the folder (it starts open) — stays on folder
+        app.handle_key_event(key_event(KeyCode::Left));
+        assert_eq!(
+            app.tree_state.selected().len(),
+            1,
+            "First Left should close folder, selection stays"
+        );
+
+        // Second Left on a closed folder — selection must not become empty
+        app.handle_key_event(key_event(KeyCode::Left));
+        assert!(
+            !app.tree_state.selected().is_empty(),
+            "Second Left on a closed folder should not clear the selection"
+        );
+        assert_eq!(
+            app.tree_state.selected().len(),
+            1,
+            "Selection should remain on the folder node"
         );
     }
 
