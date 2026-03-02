@@ -15,7 +15,6 @@ use ratatui::crossterm::event::KeyModifiers;
 use ratatui::layout::Constraint;
 use ratatui::layout::Direction;
 use ratatui::layout::Layout;
-use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::text::Line;
@@ -38,6 +37,7 @@ use crate::settings::SettingsCollection;
 use crate::settings::SettingsFile;
 use crate::settings::SettingsLineMap;
 use crate::settings::format_settings_with_map;
+use crate::tui::theme::Theme;
 
 pub type TreeId = String;
 
@@ -268,6 +268,7 @@ pub struct App {
     pub settings_state: SettingsState,
     pub settings_collection: Option<SettingsCollection>,
     pub edit_state: Option<EditState>,
+    pub theme: Theme,
 }
 
 impl App {
@@ -311,6 +312,7 @@ impl App {
             settings_state: SettingsState::default(),
             settings_collection: None,
             edit_state: None,
+            theme: Theme::dark(),
         };
 
         app.load_selected_content();
@@ -326,11 +328,8 @@ impl App {
     }
 
     fn help_line(&self) -> Line<'static> {
-        let key_style = Style::default()
-            .fg(Color::Cyan)
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD);
-        let desc_style = Style::default().fg(Color::Gray);
+        let key_style = self.theme.help_key;
+        let desc_style = self.theme.help_desc;
         let sep = Span::styled("  ", desc_style);
 
         let pairs: Vec<(&str, &str)> = match self.screen {
@@ -343,6 +342,7 @@ impl App {
                     ("2", "Settings"),
                     ("m", "Per-file"),
                     ("j/k", "Scroll"),
+                    ("T", "Theme"),
                     ("q", "Quit"),
                 ]
             }
@@ -353,6 +353,7 @@ impl App {
                     ("e", "Edit"),
                     ("m", "Merge"),
                     ("j/k", "Scroll"),
+                    ("T", "Theme"),
                     ("q", "Quit"),
                 ]
             }
@@ -367,6 +368,7 @@ impl App {
                         ("e", "Edit"),
                         ("v", "Select"),
                         ("L", "Library"),
+                        ("T", "Theme"),
                     ]
                 }
                 Mode::Normal => {
@@ -376,6 +378,7 @@ impl App {
                         ("q", "Quit"),
                         ("Tab", "Content"),
                         ("j/k", "Navigate"),
+                        ("T", "Theme"),
                     ]
                 }
                 Mode::VisualSelect => {
@@ -453,7 +456,7 @@ impl App {
                 let input_widget = Paragraph::new(self.title_input.as_str()).block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Yellow))
+                        .border_style(self.theme.input_border)
                         .title(bar_title),
                 );
                 frame.render_widget(input_widget, bar_area);
@@ -474,10 +477,8 @@ impl App {
     }
 
     fn draw_tab_bar(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let active_style = Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD);
-        let inactive_style = Style::default().fg(Color::DarkGray);
+        let active_style = self.theme.active_tab;
+        let inactive_style = self.theme.inactive_tab;
 
         let files_style = if self.screen == Screen::Files {
             active_style
@@ -510,15 +511,15 @@ impl App {
             .split(area);
 
         let file_border_style = if self.active_pane == Pane::FileList {
-            Style::default().fg(Color::Cyan)
+            self.theme.active_border
         } else {
-            Style::default()
+            self.theme.inactive_border
         };
 
         let content_border_style = if self.active_pane == Pane::Content {
-            Style::default().fg(Color::Cyan)
+            self.theme.active_border
         } else {
-            Style::default()
+            self.theme.inactive_border
         };
 
         if let Ok(tree) = Tree::new(&self.tree_items) {
@@ -529,7 +530,7 @@ impl App {
                         .border_style(file_border_style)
                         .title("CLAUDE.md files"),
                 )
-                .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+                .highlight_style(self.theme.highlight);
             frame.render_stateful_widget(tree, chunks[0], &mut self.tree_state);
         }
 
@@ -549,7 +550,7 @@ impl App {
         self.settings_state.viewport_height = area.height.saturating_sub(2);
 
         let cursor_line = self.settings_state.cursor;
-        let cursor_style = Style::default().add_modifier(Modifier::REVERSED);
+        let cursor_style = self.theme.highlight;
 
         let lines: Vec<Line> = self
             .settings_state
@@ -611,8 +612,8 @@ impl App {
         let selection = self.content.selection_range();
         let cursor_line = self.content.cursor;
         let show_cursor = self.active_pane == Pane::Content;
-        let cursor_style = Style::default().add_modifier(Modifier::REVERSED);
-        let highlight_style = Style::default().bg(Color::DarkGray);
+        let cursor_style = self.theme.highlight;
+        let highlight_style = self.theme.visual_selection;
 
         let lines: Vec<Line> = display_text
             .lines()
@@ -693,7 +694,7 @@ impl App {
             .enumerate()
             .map(|(i, snippet)| {
                 let style = if i == self.library_selected {
-                    Style::default().add_modifier(Modifier::REVERSED)
+                    self.theme.highlight
                 } else {
                     Style::default()
                 };
@@ -751,7 +752,7 @@ impl App {
         edit.textarea.set_block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow))
+                .border_style(self.theme.input_border)
                 .title(title),
         );
 
@@ -916,7 +917,7 @@ impl App {
 
         let mut textarea = TextArea::new(lines);
         textarea.set_tab_length(4);
-        textarea.set_cursor_line_style(Style::default().add_modifier(Modifier::UNDERLINED));
+        textarea.set_cursor_line_style(self.theme.edit_cursor_line);
 
         self.edit_state = Some(EditState {
             textarea,
@@ -1099,7 +1100,7 @@ impl App {
             return;
         }
 
-        // Screen switching only in Normal mode
+        // Screen switching and theme toggle only in Normal mode
         if self.mode == Mode::Normal {
             match key_event.code {
                 KeyCode::Char('1') => {
@@ -1108,6 +1109,10 @@ impl App {
                 }
                 KeyCode::Char('2') => {
                     self.switch_to_settings();
+                    return;
+                }
+                KeyCode::Char('T') => {
+                    self.theme = self.theme.toggle();
                     return;
                 }
                 _ => {}
@@ -3325,5 +3330,72 @@ mod tests {
             saved, original_content,
             "File without trailing newline should stay without one"
         );
+    }
+
+    #[test]
+    fn shift_t_toggles_theme_in_normal_mode() {
+        let mut app = App::new(vec![]);
+        assert!(app.theme.is_dark);
+
+        let shift_t = KeyEvent {
+            code: KeyCode::Char('T'),
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        app.handle_key_event(shift_t);
+        assert!(!app.theme.is_dark, "Theme should toggle to light");
+
+        app.handle_key_event(shift_t);
+        assert!(app.theme.is_dark, "Theme should toggle back to dark");
+    }
+
+    #[test]
+    fn shift_t_ignored_in_edit_mode() {
+        let mut app = App::new(vec![]);
+        // Force into edit mode by setting mode directly
+        app.mode = Mode::Edit;
+
+        let shift_t = KeyEvent {
+            code: KeyCode::Char('T'),
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        app.handle_key_event(shift_t);
+        assert!(app.theme.is_dark, "Theme should not toggle in edit mode");
+    }
+
+    #[test]
+    fn shift_t_ignored_in_title_input_mode() {
+        let mut app = App::new(vec![]);
+        app.mode = Mode::TitleInput;
+
+        let shift_t = KeyEvent {
+            code: KeyCode::Char('T'),
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        app.handle_key_event(shift_t);
+        assert!(
+            app.theme.is_dark,
+            "Theme should not toggle in title input mode"
+        );
+    }
+
+    #[test]
+    fn shift_t_toggles_on_settings_screen() {
+        let mut app = App::new(vec![]);
+        app.screen = Screen::Settings;
+
+        let shift_t = KeyEvent {
+            code: KeyCode::Char('T'),
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        };
+        app.handle_key_event(shift_t);
+        assert!(!app.theme.is_dark, "Theme should toggle on settings screen");
     }
 }
