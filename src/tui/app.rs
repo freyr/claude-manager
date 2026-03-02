@@ -228,52 +228,105 @@ impl SettingsState {
         }
     }
 
-    /// Returns true if the line at the given index is a section header (`▾`
-    /// or `▸` prefix).
-    pub fn is_section_header(&self, line_idx: usize) -> bool {
-        self.lines
-            .get(line_idx)
-            .is_some_and(|l| l.starts_with('▾') || l.starts_with('▸'))
+    /// Returns the indentation depth of a line. `▾`/`▸` headers are depth 0.
+    fn indent_depth(line: &str) -> usize {
+        if line.starts_with('▾') || line.starts_with('▸') {
+            return 0;
+        }
+        line.len() - line.trim_start().len()
     }
 
-    /// Finds the index of the section header that contains the given line.
-    /// Returns `None` if the line is itself a header or has no parent.
-    pub fn section_header_for(&self, line_idx: usize) -> Option<usize> {
-        if self.is_section_header(line_idx) {
+    /// Returns true if the line at the given index has children (the next
+    /// non-blank line has deeper indentation).
+    pub fn is_foldable(&self, line_idx: usize) -> bool {
+        let Some(line) = self.lines.get(line_idx) else {
+            return false;
+        };
+        if line.trim().is_empty() {
+            return false;
+        }
+        let depth = Self::indent_depth(line);
+        // Find the next non-blank line.
+        self.lines[(line_idx + 1)..]
+            .iter()
+            .find(|l| !l.trim().is_empty())
+            .is_some_and(|next| Self::indent_depth(next) > depth)
+    }
+
+    /// Finds the nearest parent line (lesser indentation) above `line_idx`.
+    /// Returns `None` if the line is at top level or has no parent.
+    pub fn parent_for(&self, line_idx: usize) -> Option<usize> {
+        let line = self.lines.get(line_idx)?;
+        let depth = Self::indent_depth(line);
+        if depth == 0 {
             return None;
         }
-        (0..line_idx).rev().find(|&i| self.is_section_header(i))
+        (0..line_idx)
+            .rev()
+            .find(|&i| Self::indent_depth(&self.lines[i]) < depth)
     }
 
     /// Returns true if the line at the given index should be displayed.
-    /// Section headers are always visible. Content lines are hidden when
-    /// their parent section is collapsed.
+    /// A line is hidden if any of its ancestors is collapsed.
     pub fn is_line_visible(&self, line_idx: usize) -> bool {
-        if self.is_section_header(line_idx) {
+        let Some(line) = self.lines.get(line_idx) else {
+            return false;
+        };
+        if line.trim().is_empty() {
+            // Blank separators: visible unless the next non-blank line is
+            // hidden (i.e. the section below is folded at depth 0).
+            return !self.is_blank_line_hidden(line_idx);
+        }
+        let depth = Self::indent_depth(line);
+        if depth == 0 {
             return true;
         }
-        match self.section_header_for(line_idx) {
-            Some(header_idx) => !self.collapsed.contains(&header_idx),
-            None => true,
+        // Walk up through ancestors: if any is collapsed, this line is hidden.
+        let mut check = line_idx;
+        loop {
+            match self.parent_for(check) {
+                Some(parent) => {
+                    if self.collapsed.contains(&parent) {
+                        return false;
+                    }
+                    check = parent;
+                }
+                None => return true,
+            }
         }
     }
 
-    /// Toggles the collapsed state of the section at the given header index.
-    /// Updates the `▾`/`▸` indicator in the line text.
-    pub fn toggle_fold(&mut self, header_idx: usize) {
-        if !self.is_section_header(header_idx) {
+    /// Checks whether a blank separator line should be hidden.
+    fn is_blank_line_hidden(&self, line_idx: usize) -> bool {
+        // A blank line is a separator between sections. It is hidden if the
+        // section *above* it is collapsed at the top level.
+        (0..line_idx)
+            .rev()
+            .find(|&i| !self.lines[i].trim().is_empty())
+            .is_some_and(|above| {
+                Self::indent_depth(&self.lines[above]) > 0
+                    && self
+                        .parent_for(above)
+                        .is_some_and(|p| self.collapsed.contains(&p))
+            })
+    }
+
+    /// Toggles the collapsed state of the line at `line_idx`.
+    /// Only works on foldable lines. Updates `▾`/`▸` on top-level headers.
+    pub fn toggle_fold(&mut self, line_idx: usize) {
+        if !self.is_foldable(line_idx) {
             return;
         }
-        if self.collapsed.contains(&header_idx) {
-            self.collapsed.remove(&header_idx);
-            if let Some(line) = self.lines.get_mut(header_idx)
+        if self.collapsed.contains(&line_idx) {
+            self.collapsed.remove(&line_idx);
+            if let Some(line) = self.lines.get_mut(line_idx)
                 && line.starts_with('▸')
             {
                 line.replace_range(..3, "▾");
             }
         } else {
-            self.collapsed.insert(header_idx);
-            if let Some(line) = self.lines.get_mut(header_idx)
+            self.collapsed.insert(line_idx);
+            if let Some(line) = self.lines.get_mut(line_idx)
                 && line.starts_with('▾')
             {
                 line.replace_range(..3, "▸");
@@ -1156,23 +1209,21 @@ impl App {
             }
             KeyCode::Left | KeyCode::Char('h') => {
                 let cursor = self.settings_state.cursor;
-                if self.settings_state.is_section_header(cursor) {
-                    // On a header: collapse it
-                    if !self.settings_state.collapsed.contains(&cursor) {
-                        self.settings_state.toggle_fold(cursor);
-                    }
-                } else if let Some(header) = self.settings_state.section_header_for(cursor) {
-                    // On a content line: jump to parent header
-                    self.settings_state.cursor = header;
+                if self.settings_state.is_foldable(cursor)
+                    && !self.settings_state.collapsed.contains(&cursor)
+                {
+                    // On a foldable line: collapse it
+                    self.settings_state.toggle_fold(cursor);
+                } else if let Some(parent) = self.settings_state.parent_for(cursor) {
+                    // On a child line: jump to parent
+                    self.settings_state.cursor = parent;
                     self.settings_state.ensure_cursor_visible();
                 }
             }
             KeyCode::Right | KeyCode::Char('l') => {
                 let cursor = self.settings_state.cursor;
-                if self.settings_state.is_section_header(cursor)
-                    && self.settings_state.collapsed.contains(&cursor)
-                {
-                    // On a collapsed header: expand it
+                if self.settings_state.collapsed.contains(&cursor) {
+                    // On a collapsed line: expand it
                     self.settings_state.toggle_fold(cursor);
                 }
             }
@@ -3514,54 +3565,75 @@ mod tests {
         app
     }
 
-    #[test]
-    fn is_section_header_detects_expanded() {
-        let app = settings_app_with_lines(vec!["▾ Global (/path)", "  Model: opus"]);
-        assert!(app.settings_state.is_section_header(0));
-        assert!(!app.settings_state.is_section_header(1));
-    }
+    // --- Fold/unfold tests ---
 
     #[test]
-    fn is_section_header_detects_collapsed() {
-        let mut app = settings_app_with_lines(vec!["▾ Global (/path)", "  Model: opus"]);
-        app.settings_state.toggle_fold(0);
-        assert!(app.settings_state.is_section_header(0));
-        assert!(app.settings_state.lines[0].starts_with('▸'));
-    }
-
-    #[test]
-    fn section_header_for_returns_parent() {
+    fn is_foldable_detects_lines_with_children() {
         let app = settings_app_with_lines(vec![
             "▾ Global (/path)",
             "  Model: opus",
-            "  Thinking: true",
+            "  MCP Servers:",
+            "    rust-cargo: npx rust-cargo",
         ]);
-        assert_eq!(app.settings_state.section_header_for(0), None);
-        assert_eq!(app.settings_state.section_header_for(1), Some(0));
-        assert_eq!(app.settings_state.section_header_for(2), Some(0));
+        assert!(app.settings_state.is_foldable(0), "Top header is foldable");
+        assert!(!app.settings_state.is_foldable(1), "Leaf is not foldable");
+        assert!(app.settings_state.is_foldable(2), "Sub-header is foldable");
+        assert!(!app.settings_state.is_foldable(3), "Leaf is not foldable");
     }
 
     #[test]
-    fn toggle_fold_hides_content_lines() {
+    fn parent_for_returns_nearest_ancestor() {
+        let app = settings_app_with_lines(vec![
+            "▾ Global (/path)",
+            "  MCP Servers:",
+            "    rust-cargo: npx",
+        ]);
+        assert_eq!(app.settings_state.parent_for(0), None);
+        assert_eq!(app.settings_state.parent_for(1), Some(0));
+        assert_eq!(app.settings_state.parent_for(2), Some(1));
+    }
+
+    #[test]
+    fn fold_top_level_hides_all_children() {
         let mut app = settings_app_with_lines(vec![
             "▾ Global (/path)",
             "  Model: opus",
-            "  Thinking: true",
+            "  MCP Servers:",
+            "    rust-cargo: npx",
         ]);
-        assert!(app.settings_state.is_line_visible(1));
-
         app.settings_state.toggle_fold(0);
         assert!(
             app.settings_state.is_line_visible(0),
             "Header stays visible"
         );
-        assert!(!app.settings_state.is_line_visible(1), "Content hidden");
-        assert!(!app.settings_state.is_line_visible(2), "Content hidden");
+        assert!(!app.settings_state.is_line_visible(1));
+        assert!(!app.settings_state.is_line_visible(2));
+        assert!(!app.settings_state.is_line_visible(3));
 
         app.settings_state.toggle_fold(0);
+        assert!(app.settings_state.is_line_visible(3), "All visible again");
+    }
+
+    #[test]
+    fn fold_sub_section_hides_only_its_children() {
+        let mut app = settings_app_with_lines(vec![
+            "▾ Global (/path)",
+            "  Model: opus",
+            "  MCP Servers:",
+            "    rust-cargo: npx",
+            "    github: gh",
+            "  Thinking: true",
+        ]);
+        // Fold "  MCP Servers:"
+        app.settings_state.toggle_fold(2);
+        assert!(app.settings_state.is_line_visible(0));
+        assert!(app.settings_state.is_line_visible(1), "Model still visible");
+        assert!(app.settings_state.is_line_visible(2), "MCP header visible");
+        assert!(!app.settings_state.is_line_visible(3), "rust-cargo hidden");
+        assert!(!app.settings_state.is_line_visible(4), "github hidden");
         assert!(
-            app.settings_state.is_line_visible(1),
-            "Content visible again"
+            app.settings_state.is_line_visible(5),
+            "Thinking still visible"
         );
     }
 
@@ -3598,66 +3670,94 @@ mod tests {
     }
 
     #[test]
-    fn left_arrow_on_header_collapses_section() {
-        let mut app = settings_app_with_lines(vec!["▾ Global (/path)", "  Model: opus"]);
-        app.settings_state.cursor = 0;
-
-        app.handle_key_event(key_event(KeyCode::Left));
-        assert!(
-            app.settings_state.collapsed.contains(&0),
-            "Section should be collapsed"
-        );
-        assert!(app.settings_state.lines[0].starts_with('▸'));
-    }
-
-    #[test]
-    fn left_arrow_on_content_jumps_to_header() {
+    fn cursor_skips_sub_section_collapsed_lines() {
         let mut app = settings_app_with_lines(vec![
             "▾ Global (/path)",
-            "  Model: opus",
+            "  MCP Servers:",
+            "    rust-cargo: npx",
+            "    github: gh",
             "  Thinking: true",
         ]);
-        app.settings_state.cursor = 2;
+        app.settings_state.toggle_fold(1); // Fold MCP Servers
+        app.settings_state.cursor = 1;
+
+        app.settings_state.cursor_down();
+        assert_eq!(app.settings_state.cursor, 4, "Should skip to Thinking");
+    }
+
+    #[test]
+    fn left_arrow_on_foldable_collapses() {
+        let mut app = settings_app_with_lines(vec![
+            "▾ Global (/path)",
+            "  MCP Servers:",
+            "    rust-cargo: npx",
+        ]);
+        app.settings_state.cursor = 1; // On "  MCP Servers:"
 
         app.handle_key_event(key_event(KeyCode::Left));
-        assert_eq!(app.settings_state.cursor, 0, "Should jump to parent header");
-    }
-
-    #[test]
-    fn right_arrow_on_collapsed_header_expands() {
-        let mut app = settings_app_with_lines(vec!["▾ Global (/path)", "  Model: opus"]);
-        app.settings_state.toggle_fold(0);
-        app.settings_state.cursor = 0;
-
-        app.handle_key_event(key_event(KeyCode::Right));
         assert!(
-            !app.settings_state.collapsed.contains(&0),
-            "Section should be expanded"
-        );
-        assert!(app.settings_state.lines[0].starts_with('▾'));
-    }
-
-    #[test]
-    fn right_arrow_on_expanded_header_is_noop() {
-        let mut app = settings_app_with_lines(vec!["▾ Global (/path)", "  Model: opus"]);
-        app.settings_state.cursor = 0;
-
-        app.handle_key_event(key_event(KeyCode::Right));
-        assert!(
-            !app.settings_state.collapsed.contains(&0),
-            "Should stay expanded"
+            app.settings_state.collapsed.contains(&1),
+            "Sub-section should be collapsed"
         );
     }
 
     #[test]
-    fn left_on_already_collapsed_header_is_noop() {
+    fn left_arrow_on_leaf_jumps_to_parent() {
+        let mut app = settings_app_with_lines(vec![
+            "▾ Global (/path)",
+            "  MCP Servers:",
+            "    rust-cargo: npx",
+        ]);
+        app.settings_state.cursor = 2; // On "    rust-cargo: npx"
+
+        app.handle_key_event(key_event(KeyCode::Left));
+        assert_eq!(
+            app.settings_state.cursor, 1,
+            "Should jump to MCP Servers parent"
+        );
+    }
+
+    #[test]
+    fn left_on_collapsed_foldable_jumps_to_parent() {
+        let mut app = settings_app_with_lines(vec![
+            "▾ Global (/path)",
+            "  MCP Servers:",
+            "    rust-cargo: npx",
+        ]);
+        app.settings_state.toggle_fold(1); // Already collapsed
+        app.settings_state.cursor = 1;
+
+        app.handle_key_event(key_event(KeyCode::Left));
+        assert_eq!(
+            app.settings_state.cursor, 0,
+            "Should jump to top-level parent"
+        );
+    }
+
+    #[test]
+    fn right_arrow_on_collapsed_sub_section_expands() {
+        let mut app = settings_app_with_lines(vec![
+            "▾ Global (/path)",
+            "  MCP Servers:",
+            "    rust-cargo: npx",
+        ]);
+        app.settings_state.toggle_fold(1);
+        app.settings_state.cursor = 1;
+
+        app.handle_key_event(key_event(KeyCode::Right));
+        assert!(
+            !app.settings_state.collapsed.contains(&1),
+            "Sub-section should be expanded"
+        );
+    }
+
+    #[test]
+    fn right_arrow_on_expanded_is_noop() {
         let mut app = settings_app_with_lines(vec!["▾ Global (/path)", "  Model: opus"]);
-        app.settings_state.toggle_fold(0);
         app.settings_state.cursor = 0;
 
-        // Left again should not change anything
-        app.handle_key_event(key_event(KeyCode::Left));
-        assert!(app.settings_state.collapsed.contains(&0));
+        app.handle_key_event(key_event(KeyCode::Right));
+        assert!(!app.settings_state.collapsed.contains(&0));
     }
 
     #[test]
@@ -3665,17 +3765,30 @@ mod tests {
         let mut app = settings_app_with_lines(vec![
             "▾ Global (/path)",
             "  Model: opus",
-            "  Thinking: true",
-            "▾ Project (/other)",
-            "  Model: sonnet",
+            "  MCP Servers:",
+            "    rust-cargo: npx",
+            "    github: gh",
         ]);
         assert_eq!(app.settings_state.visible_line_count(), 5);
 
-        app.settings_state.toggle_fold(0);
+        app.settings_state.toggle_fold(2); // Fold MCP Servers
         assert_eq!(app.settings_state.visible_line_count(), 3);
 
-        app.settings_state.toggle_fold(3);
-        assert_eq!(app.settings_state.visible_line_count(), 2);
+        app.settings_state.toggle_fold(0); // Fold entire Global
+        assert_eq!(app.settings_state.visible_line_count(), 1);
+    }
+
+    #[test]
+    fn nested_fold_parent_hides_expanded_children() {
+        let mut app = settings_app_with_lines(vec![
+            "▾ Global (/path)",
+            "  MCP Servers:",
+            "    rust-cargo: npx",
+        ]);
+        // Children of MCP Servers are expanded, but fold the parent
+        app.settings_state.toggle_fold(0);
+        assert!(!app.settings_state.is_line_visible(1), "MCP Servers hidden");
+        assert!(!app.settings_state.is_line_visible(2), "rust-cargo hidden");
     }
 
     #[test]
@@ -3683,7 +3796,6 @@ mod tests {
         let mut app = settings_app_with_lines(vec!["▾ Global (/path)", "  Model: opus"]);
         app.settings_state.collapsed.insert(0);
 
-        // Simulating rebuild by toggling merged view
         app.settings_state.collapsed.clear();
         assert!(app.settings_state.collapsed.is_empty());
     }
