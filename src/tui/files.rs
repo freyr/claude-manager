@@ -360,6 +360,7 @@ impl App {
         match crate::library::append_snippet(snippet, path) {
             Ok(()) => {
                 self.status_message = Some("Snippet saved!".to_string());
+                self.compose_state = None;
             }
             Err(err) => {
                 self.status_message = Some(format!("Save failed: {err}"));
@@ -483,6 +484,7 @@ impl App {
                 if let Ok(lib) = crate::library::load_library(path) {
                     self.library = Some(lib);
                 }
+                self.compose_state = None;
                 self.status_message = Some("Snippet renamed.".to_string());
             }
             Err(err) => {
@@ -523,6 +525,7 @@ impl App {
                         self.library_selected = 0;
                     }
                 }
+                self.compose_state = None;
                 self.status_message = Some("Snippet deleted.".to_string());
             }
             Err(err) => {

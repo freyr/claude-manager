@@ -3,7 +3,7 @@ title: "feat: Snippet compose mode (Phase 2)"
 type: feat
 date: 2026-03-02
 issue: "#1"
-status: waiting (blocked by #19 — app.rs split)
+status: implemented
 ---
 
 # Snippet Compose Mode (Phase 2)
@@ -147,19 +147,19 @@ Single function. Separator hardcoded. No `order` parameter.
 
 ## Acceptance Criteria
 
-- [ ] Key `3` opens the Compose screen with tab bar showing `[1 Files] [2 Settings] [3 Compose]`
-- [ ] Library snippets displayed with `[ ]`/`[x]` checkboxes
-- [ ] `j`/`k` navigates the snippet list; cursor is visually highlighted
-- [ ] `Space` toggles snippet selection
-- [ ] `p` shows full-screen composed preview; `Esc` returns to list
-- [ ] `w` enters path input; file is written atomically on `Enter`
-- [ ] Path input supports `~` expansion
-- [ ] `Esc` returns to Files screen; `q` exits the app
-- [ ] Empty library shows a helpful empty-state message
-- [ ] Export with no selection shows "No snippets selected" status
-- [ ] Help bar shows context-appropriate keybindings for Compose
-- [ ] All code passes `cargo clippy --all-targets -- -D warnings`
-- [ ] All new functionality covered by unit and integration tests (TDD)
+- [x] Key `3` opens the Compose screen with tab bar showing `[1 Files] [2 Settings] [3 Compose]`
+- [x] Library snippets displayed with `[ ]`/`[x]` checkboxes
+- [x] `j`/`k` navigates the snippet list; cursor is visually highlighted
+- [x] `Space` toggles snippet selection
+- [x] `p` shows full-screen composed preview; `Esc` returns to list
+- [x] `w` enters path input; file is written atomically on `Enter`
+- [x] Path input supports `~` expansion
+- [x] `Esc` returns to Files screen; `q` exits the app
+- [x] Empty library shows a helpful empty-state message
+- [x] Export with no selection shows "No snippets selected" status
+- [x] Help bar shows context-appropriate keybindings for Compose
+- [x] All code passes `cargo clippy --all-targets -- -D warnings`
+- [x] All new functionality covered by unit and integration tests (TDD)
 
 ## Dependencies & Risks
 

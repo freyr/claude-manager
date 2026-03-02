@@ -1,3 +1,4 @@
+pub mod compose;
 pub mod config;
 pub mod discovery;
 pub mod library;

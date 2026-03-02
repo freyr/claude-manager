@@ -36,6 +36,7 @@ pub type TreeId = String;
 pub enum Screen {
     Files,
     Settings,
+    Compose,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +53,7 @@ pub enum Mode {
     LibraryBrowse,
     RenameInput,
     Edit,
+    ExportPath,
 }
 
 #[derive(Debug)]
@@ -390,6 +392,7 @@ pub struct App {
     pub settings_state: SettingsState,
     pub settings_collection: Option<SettingsCollection>,
     pub edit_state: Option<EditState>,
+    pub compose_state: Option<super::compose::ComposeState>,
     pub theme: Theme,
 }
 
@@ -434,6 +437,7 @@ impl App {
             settings_state: SettingsState::default(),
             settings_collection: None,
             edit_state: None,
+            compose_state: None,
             theme: match config.theme.as_deref() {
                 Some("light") => Theme::light(),
                 _ => Theme::dark(),
@@ -458,6 +462,21 @@ impl App {
         let sep = Span::styled("  ", desc_style);
 
         let pairs: Vec<(&str, &str)> = match self.screen {
+            Screen::Compose if self.mode == Mode::ExportPath => {
+                vec![("Enter", "Export"), ("Esc", "Cancel")]
+            }
+            Screen::Compose => {
+                vec![
+                    ("1", "Files"),
+                    ("2", "Settings"),
+                    ("3", "Compose"),
+                    ("Space", "Toggle"),
+                    ("p", "Preview"),
+                    ("w", "Export"),
+                    ("j/k", "Navigate"),
+                    ("q", "Quit"),
+                ]
+            }
             Screen::Settings if self.mode == Mode::Edit => {
                 vec![("Ctrl+S", "Save"), ("Esc", "Cancel")]
             }
@@ -528,6 +547,9 @@ impl App {
                 Mode::Edit => {
                     vec![("Ctrl+S", "Save"), ("Esc", "Cancel")]
                 }
+                Mode::ExportPath => {
+                    vec![("Enter", "Export"), ("Esc", "Cancel")]
+                }
             },
         };
 
@@ -546,6 +568,7 @@ impl App {
         // Vertical layout: tab_bar + main area + optional input/status bar + help bar
         let has_input_or_status = self.mode == Mode::TitleInput
             || self.mode == Mode::RenameInput
+            || self.mode == Mode::ExportPath
             || self.status_message.is_some();
 
         let mut constraints = vec![Constraint::Length(1), Constraint::Min(3)];
@@ -569,16 +592,20 @@ impl App {
         match self.screen {
             Screen::Files => self.draw_files_screen(frame, main_area),
             Screen::Settings => self.draw_settings_screen(frame, main_area),
+            Screen::Compose => self.draw_compose_screen(frame, main_area),
         }
 
         // Input/status bar (when active, Files screen only)
         if has_input_or_status {
             let bar_area = vertical[2];
-            if self.mode == Mode::TitleInput || self.mode == Mode::RenameInput {
-                let bar_title = if self.mode == Mode::RenameInput {
-                    "Rename snippet"
-                } else {
-                    "Snippet title"
+            if self.mode == Mode::TitleInput
+                || self.mode == Mode::RenameInput
+                || self.mode == Mode::ExportPath
+            {
+                let bar_title = match self.mode {
+                    Mode::RenameInput => "Rename snippet",
+                    Mode::ExportPath => "Export path",
+                    _ => "Snippet title",
                 };
                 let input_widget = Paragraph::new(self.title_input.as_str()).block(
                     Block::default()
@@ -607,20 +634,18 @@ impl App {
         let active_style = self.theme.active_tab;
         let inactive_style = self.theme.inactive_tab;
 
-        let files_style = if self.screen == Screen::Files {
-            active_style
-        } else {
-            inactive_style
-        };
-        let settings_style = if self.screen == Screen::Settings {
-            active_style
-        } else {
-            inactive_style
+        let style_for = |s: Screen| {
+            if self.screen == s {
+                active_style
+            } else {
+                inactive_style
+            }
         };
 
         let tab_line = Line::from(vec![
-            Span::styled(" [1 Files] ", files_style),
-            Span::styled(" [2 Settings] ", settings_style),
+            Span::styled(" [1 Files] ", style_for(Screen::Files)),
+            Span::styled(" [2 Settings] ", style_for(Screen::Settings)),
+            Span::styled(" [3 Compose] ", style_for(Screen::Compose)),
         ]);
         frame.render_widget(Paragraph::new(tab_line), area);
     }
@@ -694,6 +719,10 @@ impl App {
                     self.switch_to_settings();
                     return;
                 }
+                KeyCode::Char('3') => {
+                    self.enter_compose_screen();
+                    return;
+                }
                 KeyCode::Char('T') => {
                     self.theme = self.theme.toggle();
                     return;
@@ -715,9 +744,15 @@ impl App {
                 Mode::TitleInput => self.handle_title_input_key(key_event),
                 Mode::LibraryBrowse => self.handle_library_browse_key(key_event),
                 Mode::RenameInput => self.handle_rename_input_key(key_event),
-                Mode::Edit => {} // handled above
+                Mode::Edit => {}       // handled above
+                Mode::ExportPath => {} // not used on Files screen
             },
             Screen::Settings => self.handle_settings_key(key_event),
+            Screen::Compose => match self.mode {
+                Mode::Normal => self.handle_compose_key(key_event),
+                Mode::ExportPath => self.handle_export_path_key(key_event),
+                _ => {}
+            },
         }
     }
 }
