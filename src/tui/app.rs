@@ -537,7 +537,7 @@ impl App {
         self.settings_state.viewport_height = area.height.saturating_sub(2);
 
         let cursor_line = self.settings_state.cursor;
-        let cursor_style = Style::default().add_modifier(Modifier::UNDERLINED);
+        let cursor_style = Style::default().add_modifier(Modifier::REVERSED);
 
         let lines: Vec<Line> = self
             .settings_state
@@ -594,7 +594,7 @@ impl App {
         let selection = self.content.selection_range();
         let cursor_line = self.content.cursor;
         let show_cursor = self.active_pane == Pane::Content;
-        let cursor_style = Style::default().add_modifier(Modifier::UNDERLINED);
+        let cursor_style = Style::default().add_modifier(Modifier::REVERSED);
         let highlight_style = Style::default().bg(Color::DarkGray);
 
         let lines: Vec<Line> = display_text
@@ -609,12 +609,19 @@ impl App {
                     style = highlight_style;
                 }
                 if show_cursor && i == cursor_line {
-                    style = style.add_modifier(Modifier::UNDERLINED);
+                    style = style.add_modifier(Modifier::REVERSED);
                     if selection.is_none() {
                         style = cursor_style;
                     }
                 }
-                Line::from(line_text.to_string()).style(style)
+                // Ensure the cursor line has at least a space so the
+                // REVERSED style is visible even on empty lines.
+                let text = if show_cursor && i == cursor_line && line_text.is_empty() {
+                    " ".to_string()
+                } else {
+                    line_text.to_string()
+                };
+                Line::from(text).style(style)
             })
             .collect();
 
@@ -1601,6 +1608,41 @@ mod tests {
             app.tree_state.selected().len(),
             1,
             "Selection should remain on the folder node"
+        );
+    }
+
+    #[test]
+    fn cursor_on_empty_line_is_visible() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("CLAUDE.md");
+        // File with an empty second line
+        fs::write(&file, "first\n\nthird").unwrap();
+
+        let roots = vec![SourceRoot {
+            path: tmp.path().to_path_buf(),
+            files: vec![file],
+        }];
+        let mut app = App::new(roots);
+        app.active_pane = Pane::Content;
+
+        // Move cursor to the empty line (line index 1)
+        app.handle_key_event(key_event(KeyCode::Char('j')));
+        assert_eq!(app.content.cursor, 1);
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // The cursor line is row 3 in the buffer (row 0 = tab bar, row 1 = border,
+        // row 2 = first content line, row 3 = empty cursor line).
+        // Check that the empty line has a non-default style (Reversed modifier).
+        let content_x_start = (80u16 * 30 / 100) + 1;
+        let cell = &buf[(content_x_start, 3)];
+        assert!(
+            cell.modifier.contains(Modifier::REVERSED),
+            "Empty cursor line should use REVERSED style for visibility, got: {:?}",
+            cell.modifier
         );
     }
 
