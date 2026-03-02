@@ -1,3 +1,4 @@
+pub mod config;
 pub mod discovery;
 pub mod library;
 pub mod model;
@@ -6,6 +7,8 @@ pub mod tui;
 
 use clap::Parser;
 
+use crate::config::load_config;
+use crate::discovery::DEFAULT_MAX_DEPTH;
 use crate::discovery::find_claude_files;
 use crate::discovery::find_global_claude_file;
 use crate::model::Cli;
@@ -15,21 +18,38 @@ use crate::tui::app::App;
 
 pub fn run() -> ExitOutcome {
     let cli = Cli::parse();
+    let config = load_config().unwrap_or_default();
+
+    // CLI args override config; config overrides built-in defaults.
+    let is_default_paths = cli.paths.len() == 1 && cli.paths[0] == std::path::Path::new(".");
+    let paths = if is_default_paths {
+        config
+            .default_paths
+            .as_deref()
+            .unwrap_or(&cli.paths)
+            .to_vec()
+    } else {
+        cli.paths.clone()
+    };
+    let depth = cli
+        .depth
+        .or(config.default_depth)
+        .unwrap_or(DEFAULT_MAX_DEPTH);
 
     let mut roots: Vec<SourceRoot> = Vec::new();
     let mut failed_count: usize = 0;
 
     eprintln!(
         "Scanning {} {}...",
-        cli.paths.len(),
-        if cli.paths.len() == 1 {
+        paths.len(),
+        if paths.len() == 1 {
             "directory"
         } else {
             "directories"
         }
     );
 
-    for path in &cli.paths {
+    for path in &paths {
         if !path.exists() {
             eprintln!("Warning: path does not exist: {}", path.display());
             failed_count += 1;
@@ -42,7 +62,7 @@ pub fn run() -> ExitOutcome {
         }
 
         let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-        let files = find_claude_files(&canonical, cli.depth);
+        let files = find_claude_files(&canonical, depth);
         roots.push(SourceRoot {
             path: canonical,
             files,
@@ -70,7 +90,7 @@ pub fn run() -> ExitOutcome {
         print_list(&roots);
     } else {
         let mut terminal = ratatui::init();
-        let mut app = App::new(roots);
+        let mut app = App::new(roots, &config);
         let result = app.run(&mut terminal);
         ratatui::restore();
         if let Err(err) = result {
