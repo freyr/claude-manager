@@ -404,7 +404,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(roots: Vec<SourceRoot>) -> Self {
+    pub fn new(roots: Vec<SourceRoot>, config: &crate::config::Config) -> Self {
         let tree_items = build_tree_items(&roots);
         let mut tree_state = TreeState::default();
 
@@ -444,7 +444,10 @@ impl App {
             settings_state: SettingsState::default(),
             settings_collection: None,
             edit_state: None,
-            theme: Theme::dark(),
+            theme: match config.theme.as_deref() {
+                Some("light") => Theme::light(),
+                _ => Theme::dark(),
+            },
         };
 
         app.load_selected_content();
@@ -1640,6 +1643,7 @@ pub fn build_tree_items(roots: &[SourceRoot]) -> Vec<TreeItem<'static, TreeId>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::KeyEventKind;
@@ -1673,14 +1677,14 @@ mod tests {
 
     #[test]
     fn q_key_sets_exit() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.handle_key_event(key_event(KeyCode::Char('q')));
         assert!(app.exit);
     }
 
     #[test]
     fn other_keys_do_not_exit() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.handle_key_event(key_event(KeyCode::Char('a')));
         assert!(!app.exit);
     }
@@ -1697,7 +1701,7 @@ mod tests {
 
     #[test]
     fn tab_toggles_pane() {
-        let mut app = App::new(sample_roots());
+        let mut app = App::new(sample_roots(), &Config::default());
         assert_eq!(app.active_pane, Pane::FileList);
 
         app.handle_key_event(key_event(KeyCode::Tab));
@@ -1709,7 +1713,7 @@ mod tests {
 
     #[test]
     fn arrow_keys_ignored_when_content_pane_active() {
-        let mut app = App::new(sample_roots());
+        let mut app = App::new(sample_roots(), &Config::default());
         let initial_selected = app.tree_state.selected().to_vec();
 
         app.handle_key_event(key_event(KeyCode::Tab));
@@ -1729,7 +1733,7 @@ mod tests {
 
     #[test]
     fn jk_can_land_on_folder_node() {
-        let mut app = App::new(sample_roots());
+        let mut app = App::new(sample_roots(), &Config::default());
         render_once(&mut app);
 
         // App starts on first file /a/CLAUDE.md — selected len is 2
@@ -1754,7 +1758,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
             files: vec![file],
         }];
-        let mut app = App::new(roots);
+        let mut app = App::new(roots, &Config::default());
 
         // Content is loaded on startup
         assert!(app.content.text.is_some());
@@ -1772,7 +1776,7 @@ mod tests {
 
     #[test]
     fn left_arrow_to_parent_clears_content() {
-        let mut app = App::new(sample_roots());
+        let mut app = App::new(sample_roots(), &Config::default());
         render_once(&mut app);
 
         // Start on first file — content is loaded
@@ -1795,7 +1799,7 @@ mod tests {
 
     #[test]
     fn left_on_folder_node_does_not_lose_selection() {
-        let mut app = App::new(sample_roots());
+        let mut app = App::new(sample_roots(), &Config::default());
         render_once(&mut app);
 
         // Navigate to the /a folder node
@@ -1834,7 +1838,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
             files: vec![file],
         }];
-        let mut app = App::new(roots);
+        let mut app = App::new(roots, &Config::default());
         app.active_pane = Pane::Content;
 
         // Move cursor to the empty line (line index 1)
@@ -1868,7 +1872,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
             files: vec![file.clone()],
         }];
-        let mut app = App::new(roots);
+        let mut app = App::new(roots, &Config::default());
 
         // Snapshot state before pressing Enter
         let pane_before = app.active_pane;
@@ -1897,7 +1901,7 @@ mod tests {
 
     #[test]
     fn enter_on_root_node_is_noop() {
-        let mut app = App::new(sample_roots());
+        let mut app = App::new(sample_roots(), &Config::default());
 
         // Select a root node
         app.tree_state.select(vec!["/a".to_string()]);
@@ -1915,7 +1919,7 @@ mod tests {
 
     #[test]
     fn toggle_selected_on_root_toggles() {
-        let mut app = App::new(sample_roots());
+        let mut app = App::new(sample_roots(), &Config::default());
 
         // Directly select a root node (single-segment identifier)
         app.tree_state.select(vec!["/a".to_string()]);
@@ -1951,7 +1955,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
             files: vec![file.clone()],
         }];
-        let app = App::new(roots);
+        let app = App::new(roots, &Config::default());
 
         // The first file should be auto-selected and its content loaded
         assert_eq!(app.content.text.as_deref(), Some("Test content"));
@@ -1977,7 +1981,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
             files: vec![file_a, file_b.clone()],
         }];
-        let mut app = App::new(roots);
+        let mut app = App::new(roots, &Config::default());
 
         // First file is loaded on startup
         assert_eq!(app.content.text.as_deref(), Some("First content"));
@@ -1997,7 +2001,7 @@ mod tests {
             path: PathBuf::from("/nonexistent"),
             files: vec![PathBuf::from("/nonexistent/CLAUDE.md")],
         }];
-        let mut app = App::new(roots);
+        let mut app = App::new(roots, &Config::default());
 
         // Directly select the file node and load content
         app.tree_state.select(vec![
@@ -2017,7 +2021,7 @@ mod tests {
 
     #[test]
     fn cursor_moves_down_and_scrolls_when_past_viewport() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.content.text = Some("Line 0\nLine 1\nLine 2\nLine 3\nLine 4".to_string());
         app.content.viewport_height = 3; // can see 3 lines
         app.active_pane = Pane::Content;
@@ -2037,7 +2041,7 @@ mod tests {
 
     #[test]
     fn cursor_does_not_go_below_zero() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.content.text = Some("Line 0\nLine 1".to_string());
         app.active_pane = Pane::Content;
 
@@ -2047,7 +2051,7 @@ mod tests {
 
     #[test]
     fn cursor_clamps_at_last_line() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.content.text = Some("Line 0\nLine 1\nLine 2\nLine 3\nLine 4".to_string());
         app.content.viewport_height = 3;
         app.active_pane = Pane::Content;
@@ -2072,7 +2076,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
             files: vec![file],
         }];
-        let mut app = App::new(roots);
+        let mut app = App::new(roots, &Config::default());
 
         // Manually set scroll and cursor
         app.content.scroll = 5;
@@ -2123,7 +2127,7 @@ mod tests {
                 files: vec![file_b.clone()],
             },
         ];
-        let mut app = App::new(roots);
+        let mut app = App::new(roots, &Config::default());
         let width: u16 = 80;
         let height: u16 = 10;
 
@@ -2188,7 +2192,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
             files: vec![file.clone()],
         }];
-        let mut app = App::new(roots);
+        let mut app = App::new(roots, &Config::default());
 
         let root_id = tmp.path().display().to_string();
         let file_id = file.display().to_string();
@@ -2246,13 +2250,13 @@ mod tests {
 
     #[test]
     fn app_starts_in_normal_mode() {
-        let app = App::new(vec![]);
+        let app = App::new(vec![], &Config::default());
         assert_eq!(app.mode, Mode::Normal);
     }
 
     #[test]
     fn q_does_not_exit_in_visual_select_mode() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.mode = Mode::VisualSelect;
         app.handle_key_event(key_event(KeyCode::Char('q')));
         assert!(!app.exit);
@@ -2260,7 +2264,7 @@ mod tests {
 
     #[test]
     fn q_does_not_exit_in_title_input_mode() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.mode = Mode::TitleInput;
         app.handle_key_event(key_event(KeyCode::Char('q')));
         assert!(!app.exit);
@@ -2276,7 +2280,7 @@ mod tests {
             Mode::RenameInput,
             Mode::Edit,
         ] {
-            let mut app = App::new(vec![]);
+            let mut app = App::new(vec![], &Config::default());
             app.mode = mode;
             app.handle_key_event(KeyEvent {
                 code: KeyCode::Char('c'),
@@ -2290,7 +2294,7 @@ mod tests {
 
     #[test]
     fn status_message_cleared_on_keypress() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.status_message = Some("Test message".to_string());
         app.handle_key_event(key_event(KeyCode::Char('a')));
         assert!(app.status_message.is_none());
@@ -2300,7 +2304,7 @@ mod tests {
 
     #[test]
     fn v_in_content_pane_enters_visual_select() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.content.text = Some("line 0\nline 1\nline 2".to_string());
         app.active_pane = Pane::Content;
         app.content.cursor = 1;
@@ -2313,7 +2317,7 @@ mod tests {
 
     #[test]
     fn v_in_file_list_does_not_enter_visual_select() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.active_pane = Pane::FileList;
 
         app.handle_key_event(key_event(KeyCode::Char('v')));
@@ -2323,7 +2327,7 @@ mod tests {
 
     #[test]
     fn esc_in_visual_select_returns_to_normal() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.mode = Mode::VisualSelect;
         app.content.visual_anchor = Some(3);
 
@@ -2335,7 +2339,7 @@ mod tests {
 
     #[test]
     fn jk_in_visual_select_moves_cursor() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.content.text = Some("line 0\nline 1\nline 2\nline 3\nline 4".to_string());
         app.content.viewport_height = 10;
         app.mode = Mode::VisualSelect;
@@ -2353,7 +2357,7 @@ mod tests {
 
     #[test]
     fn s_in_visual_select_enters_title_input() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.mode = Mode::VisualSelect;
         app.content.visual_anchor = Some(0);
 
@@ -2373,7 +2377,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
             files: vec![file.clone()],
         }];
-        let mut app = App::new(roots);
+        let mut app = App::new(roots, &Config::default());
         app.content.visual_anchor = Some(5);
 
         // Re-load the same file
@@ -2389,7 +2393,7 @@ mod tests {
 
     #[test]
     fn title_input_chars_accumulate() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.mode = Mode::TitleInput;
 
         app.handle_key_event(key_event(KeyCode::Char('A')));
@@ -2399,7 +2403,7 @@ mod tests {
 
     #[test]
     fn title_input_backspace_deletes_at_cursor() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.mode = Mode::TitleInput;
         app.title_input = "ABC".to_string();
         app.title_cursor = 3;
@@ -2411,7 +2415,7 @@ mod tests {
 
     #[test]
     fn title_input_esc_returns_to_visual_select() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.mode = Mode::TitleInput;
         app.content.visual_anchor = Some(2);
         app.title_input = "partial".to_string();
@@ -2428,7 +2432,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let library_path = tmp.path().join("library.toml");
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.mode = Mode::TitleInput;
         app.title_input = "  ".to_string();
 
@@ -2443,7 +2447,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let library_path = tmp.path().join("library.toml");
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.content.text = Some("line 0\nline 1\nline 2\nline 3".to_string());
         app.content.visual_anchor = Some(1);
         app.content.cursor = 2;
@@ -2476,7 +2480,7 @@ mod tests {
             path: tmp_content.path().to_path_buf(),
             files: vec![file],
         }];
-        let mut app = App::new(roots);
+        let mut app = App::new(roots, &Config::default());
 
         // Switch to content pane
         app.handle_key_event(key_event(KeyCode::Tab));
@@ -2538,7 +2542,7 @@ mod tests {
         let lib_path = tmp.path().join("library.toml");
         library_with_snippets(&lib_path, &["Snippet A"]);
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.active_pane = Pane::Content;
         app.enter_library_browse_from(&lib_path);
 
@@ -2550,7 +2554,7 @@ mod tests {
 
     #[test]
     fn l_in_file_list_does_not_enter_library_browse() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.active_pane = Pane::FileList;
 
         app.handle_key_event(key_event(KeyCode::Char('L')));
@@ -2560,7 +2564,7 @@ mod tests {
 
     #[test]
     fn esc_in_library_browse_returns_to_normal() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.mode = Mode::LibraryBrowse;
         app.library = Some(crate::library::SnippetLibrary::default());
 
@@ -2572,7 +2576,7 @@ mod tests {
 
     #[test]
     fn q_in_library_browse_returns_to_normal_not_exit() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.mode = Mode::LibraryBrowse;
         app.library = Some(crate::library::SnippetLibrary::default());
 
@@ -2588,7 +2592,7 @@ mod tests {
         let lib_path = tmp.path().join("library.toml");
         library_with_snippets(&lib_path, &["A", "B", "C"]);
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.enter_library_browse_from(&lib_path);
         assert_eq!(app.library_selected, 0);
 
@@ -2617,7 +2621,7 @@ mod tests {
         let lib_path = tmp.path().join("library.toml");
         library_with_snippets(&lib_path, &["A", "B", "C"]);
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.enter_library_browse_from(&lib_path);
 
         // Select "B" (index 1) and delete it
@@ -2642,7 +2646,7 @@ mod tests {
         let lib_path = tmp.path().join("library.toml");
         library_with_snippets(&lib_path, &["A", "B"]);
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.enter_library_browse_from(&lib_path);
 
         // Select last item and delete
@@ -2660,7 +2664,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let lib_path = tmp.path().join("library.toml");
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.enter_library_browse_from(&lib_path);
 
         assert!(app.library.as_ref().unwrap().snippets.is_empty());
@@ -2676,7 +2680,7 @@ mod tests {
         let lib_path = tmp.path().join("library.toml");
         library_with_snippets(&lib_path, &["X", "Y"]);
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.enter_library_browse_from(&lib_path);
 
         let lib = app.library.as_ref().unwrap();
@@ -2693,7 +2697,7 @@ mod tests {
         let lib_path = tmp.path().join("library.toml");
         library_with_snippets(&lib_path, &["My Snippet"]);
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.enter_library_browse_from(&lib_path);
 
         app.handle_key_event(key_event(KeyCode::Char('r')));
@@ -2704,7 +2708,7 @@ mod tests {
 
     #[test]
     fn rename_esc_returns_to_library_browse() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.mode = Mode::RenameInput;
         app.title_input = "partial edit".to_string();
 
@@ -2720,7 +2724,7 @@ mod tests {
         let lib_path = tmp.path().join("library.toml");
         library_with_snippets(&lib_path, &["Old Title"]);
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.enter_library_browse_from(&lib_path);
         app.mode = Mode::RenameInput;
         app.title_input = "New Title".to_string();
@@ -2742,7 +2746,7 @@ mod tests {
         let lib_path = tmp.path().join("library.toml");
         library_with_snippets(&lib_path, &["Keep Me"]);
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.enter_library_browse_from(&lib_path);
         app.mode = Mode::RenameInput;
         app.title_input = "  ".to_string();
@@ -2762,7 +2766,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let lib_path = tmp.path().join("library.toml");
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.enter_library_browse_from(&lib_path);
 
         app.handle_key_event(key_event(KeyCode::Char('r')));
@@ -2778,13 +2782,13 @@ mod tests {
 
     #[test]
     fn app_starts_on_files_screen() {
-        let app = App::new(vec![]);
+        let app = App::new(vec![], &Config::default());
         assert_eq!(app.screen, Screen::Files);
     }
 
     #[test]
     fn pressing_2_switches_to_settings() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         let collection = crate::settings::SettingsCollection {
             files: vec![crate::settings::SettingsFile {
                 label: "Test".to_string(),
@@ -2799,7 +2803,7 @@ mod tests {
 
     #[test]
     fn pressing_1_returns_to_files() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.screen = Screen::Settings;
         app.handle_key_event(key_event(KeyCode::Char('1')));
         assert_eq!(app.screen, Screen::Files);
@@ -2807,7 +2811,7 @@ mod tests {
 
     #[test]
     fn pressing_2_in_title_input_types_char_not_switch() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.mode = Mode::TitleInput;
         app.handle_key_event(key_event(KeyCode::Char('2')));
         assert_eq!(app.screen, Screen::Files, "Should NOT switch screen");
@@ -2816,7 +2820,7 @@ mod tests {
 
     #[test]
     fn q_on_settings_exits() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.screen = Screen::Settings;
         app.handle_key_event(key_event(KeyCode::Char('q')));
         assert!(app.exit);
@@ -2824,7 +2828,7 @@ mod tests {
 
     #[test]
     fn jk_on_settings_scrolls() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.screen = Screen::Settings;
         app.settings_state.lines = vec![
             "Line 0".to_string(),
@@ -2848,13 +2852,13 @@ mod tests {
 
     #[test]
     fn edit_state_starts_as_none() {
-        let app = App::new(vec![]);
+        let app = App::new(vec![], &Config::default());
         assert!(app.edit_state.is_none());
     }
 
     #[test]
     fn ctrl_c_exits_from_edit_mode() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.mode = Mode::Edit;
         app.handle_key_event(KeyEvent {
             code: KeyCode::Char('c'),
@@ -2901,7 +2905,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
             files: vec![file],
         }];
-        let mut app = App::new(roots);
+        let mut app = App::new(roots, &Config::default());
         app.active_pane = Pane::Content;
 
         app.handle_key_event(key_event(KeyCode::Char('e')));
@@ -2923,7 +2927,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
             files: vec![file],
         }];
-        let mut app = App::new(roots);
+        let mut app = App::new(roots, &Config::default());
         app.active_pane = Pane::Content;
         app.handle_key_event(key_event(KeyCode::Char('e')));
         assert_eq!(app.mode, Mode::Edit);
@@ -2944,7 +2948,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
             files: vec![file],
         }];
-        let mut app = App::new(roots);
+        let mut app = App::new(roots, &Config::default());
         app.active_pane = Pane::FileList;
 
         app.handle_key_event(key_event(KeyCode::Char('e')));
@@ -2959,7 +2963,7 @@ mod tests {
         let file = tmp.path().join("CLAUDE.md");
         fs::write(&file, "Hello").unwrap();
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.enter_edit_mode_for(&file);
         assert_eq!(app.mode, Mode::Edit);
 
@@ -2978,7 +2982,7 @@ mod tests {
         let file = tmp.path().join("CLAUDE.md");
         fs::write(&file, "original").unwrap();
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.enter_edit_mode_for(&file);
 
         // Type something
@@ -3014,7 +3018,7 @@ mod tests {
         let file = tmp.path().join("CLAUDE.md");
         fs::write(&file, "clean").unwrap();
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.enter_edit_mode_for(&file);
 
         // Esc with no changes should exit edit mode
@@ -3030,7 +3034,7 @@ mod tests {
         let file = tmp.path().join("CLAUDE.md");
         fs::write(&file, "original").unwrap();
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.enter_edit_mode_for(&file);
         app.handle_key_event(key_event(KeyCode::Char('X')));
 
@@ -3050,7 +3054,7 @@ mod tests {
         let file = tmp.path().join("CLAUDE.md");
         fs::write(&file, "original").unwrap();
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.enter_edit_mode_for(&file);
         app.handle_key_event(key_event(KeyCode::Char('X')));
 
@@ -3074,7 +3078,7 @@ mod tests {
         let file = tmp.path().join("CLAUDE.md");
         fs::write(&file, "original").unwrap();
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.enter_edit_mode_for(&file);
         app.handle_key_event(key_event(KeyCode::Char('X')));
 
@@ -3093,7 +3097,7 @@ mod tests {
 
     #[test]
     fn help_line_shows_edit_key_in_content_pane() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.active_pane = Pane::Content;
         app.mode = Mode::Normal;
         let help = app.help_line();
@@ -3106,7 +3110,7 @@ mod tests {
 
     #[test]
     fn help_line_shows_edit_key_on_settings_screen() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.screen = Screen::Settings;
         let help = app.help_line();
         let help_text: String = help.spans.iter().map(|s| s.content.to_string()).collect();
@@ -3118,7 +3122,7 @@ mod tests {
 
     #[test]
     fn help_line_shows_save_cancel_in_edit_mode() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.mode = Mode::Edit;
         let help = app.help_line();
         let help_text: String = help.spans.iter().map(|s| s.content.to_string()).collect();
@@ -3144,7 +3148,7 @@ mod tests {
             }],
         };
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.switch_to_settings_with(&collection);
         app.settings_state.cursor = 0; // on the header line of the file
 
@@ -3164,7 +3168,7 @@ mod tests {
         let settings_file = settings_dir.join("settings.json");
         fs::write(&settings_file, r#"{"model":"opus"}"#).unwrap();
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.enter_edit_mode_for(&settings_file);
         app.screen = Screen::Settings;
         assert_eq!(app.mode, Mode::Edit);
@@ -3177,7 +3181,7 @@ mod tests {
 
     #[test]
     fn settings_file_at_cursor_resolves_path() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         let collection = crate::settings::SettingsCollection {
             files: vec![
                 crate::settings::SettingsFile {
@@ -3221,7 +3225,7 @@ mod tests {
         let file = tmp.path().join("CLAUDE.md");
         fs::write(&file, "Hello").unwrap();
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.enter_edit_mode_for(&file);
 
         app.handle_key_event(key_event(KeyCode::Char('q')));
@@ -3235,7 +3239,7 @@ mod tests {
 
     #[test]
     fn enter_edit_mode_for_nonexistent_file_stays_normal() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.enter_edit_mode_for(Path::new("/nonexistent/CLAUDE.md"));
 
         assert_eq!(app.mode, Mode::Normal, "Should stay in Normal mode");
@@ -3252,7 +3256,7 @@ mod tests {
 
     #[test]
     fn e_on_blank_separator_in_settings_shows_error() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         let collection = crate::settings::SettingsCollection {
             files: vec![
                 crate::settings::SettingsFile {
@@ -3311,7 +3315,7 @@ mod tests {
 
     #[test]
     fn m_key_toggles_merged_view() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.switch_to_settings_with(&two_file_settings_collection());
 
         // Per-file view has two section headers
@@ -3347,7 +3351,7 @@ mod tests {
 
     #[test]
     fn m_key_resets_cursor() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.switch_to_settings_with(&two_file_settings_collection());
 
         app.settings_state.cursor = 5;
@@ -3367,7 +3371,7 @@ mod tests {
 
     #[test]
     fn m_key_round_trip() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.switch_to_settings_with(&two_file_settings_collection());
         let lines_before = app.settings_state.lines.clone();
 
@@ -3381,7 +3385,7 @@ mod tests {
 
     #[test]
     fn e_disabled_in_merged_view() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.switch_to_settings_with(&two_file_settings_collection());
         app.screen = Screen::Settings;
 
@@ -3408,7 +3412,7 @@ mod tests {
 
     #[test]
     fn help_bar_shows_merge_key() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.screen = Screen::Settings;
         let help = app.help_line();
         let help_text: String = help.spans.iter().map(|s| s.content.to_string()).collect();
@@ -3424,7 +3428,7 @@ mod tests {
 
     #[test]
     fn help_bar_in_merged_omits_edit() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.screen = Screen::Settings;
         app.settings_state.merged_view = true;
         let help = app.help_line();
@@ -3446,7 +3450,7 @@ mod tests {
         let original_content = "Line 1\nLine 2\n";
         fs::write(&file, original_content).unwrap();
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.enter_edit_mode_for(&file);
         assert_eq!(app.mode, Mode::Edit);
 
@@ -3472,7 +3476,7 @@ mod tests {
         let original_content = "Line 1\nLine 2";
         fs::write(&file, original_content).unwrap();
 
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.enter_edit_mode_for(&file);
 
         // Save without making changes
@@ -3492,7 +3496,7 @@ mod tests {
 
     #[test]
     fn shift_t_toggles_theme_in_normal_mode() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         assert!(app.theme.is_dark);
 
         let shift_t = KeyEvent {
@@ -3510,7 +3514,7 @@ mod tests {
 
     #[test]
     fn shift_t_ignored_in_edit_mode() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         // Force into edit mode by setting mode directly
         app.mode = Mode::Edit;
 
@@ -3526,7 +3530,7 @@ mod tests {
 
     #[test]
     fn shift_t_ignored_in_title_input_mode() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.mode = Mode::TitleInput;
 
         let shift_t = KeyEvent {
@@ -3544,7 +3548,7 @@ mod tests {
 
     #[test]
     fn shift_t_toggles_on_settings_screen() {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.screen = Screen::Settings;
 
         let shift_t = KeyEvent {
@@ -3558,7 +3562,7 @@ mod tests {
     }
 
     fn settings_app_with_lines(lines: Vec<&str>) -> App {
-        let mut app = App::new(vec![]);
+        let mut app = App::new(vec![], &Config::default());
         app.screen = Screen::Settings;
         app.settings_state.lines = lines.into_iter().map(String::from).collect();
         app.settings_state.line_map = vec![Some(0); app.settings_state.lines.len()];
@@ -3830,5 +3834,32 @@ mod tests {
 
         app.settings_state.toggle_fold(0);
         assert!(app.settings_state.lines[0].starts_with('▾'));
+    }
+
+    #[test]
+    fn config_theme_light_starts_in_light_mode() {
+        let config = Config {
+            theme: Some("light".to_string()),
+            ..Config::default()
+        };
+        let app = App::new(vec![], &config);
+        assert!(!app.theme.is_dark);
+    }
+
+    #[test]
+    fn config_theme_dark_starts_in_dark_mode() {
+        let config = Config {
+            theme: Some("dark".to_string()),
+            ..Config::default()
+        };
+        let app = App::new(vec![], &config);
+        assert!(app.theme.is_dark);
+    }
+
+    #[test]
+    fn config_theme_none_defaults_to_dark() {
+        let config = Config::default();
+        let app = App::new(vec![], &config);
+        assert!(app.theme.is_dark);
     }
 }

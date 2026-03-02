@@ -15,9 +15,9 @@ pub struct Cli {
     #[arg(long)]
     pub list: bool,
 
-    /// Maximum directory depth to scan (default: 3)
-    #[arg(long, default_value_t = crate::discovery::DEFAULT_MAX_DEPTH)]
-    pub depth: usize,
+    /// Maximum directory depth to scan [default: 3]
+    #[arg(long)]
+    pub depth: Option<usize>,
 }
 
 /// One of the root directories provided by the user, with all CLAUDE.md files found within it.
