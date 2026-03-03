@@ -470,9 +470,6 @@ impl App {
             }
             Screen::Compose => {
                 vec![
-                    ("1", "Files"),
-                    ("2", "Settings"),
-                    ("3", "Compose"),
                     ("Space", "Toggle"),
                     ("Tab", "Preview"),
                     ("w", "Export"),
@@ -485,8 +482,6 @@ impl App {
             }
             Screen::Settings if self.settings_state.merged_view => {
                 vec![
-                    ("1", "Files"),
-                    ("2", "Settings"),
                     ("m", "Per-file"),
                     ("j/k", "Scroll"),
                     ("h/l", "Fold"),
@@ -496,8 +491,6 @@ impl App {
             }
             Screen::Settings => {
                 vec![
-                    ("1", "Files"),
-                    ("2", "Settings"),
                     ("e", "Edit"),
                     ("m", "Merge"),
                     ("j/k", "Scroll"),
@@ -509,8 +502,6 @@ impl App {
             Screen::Files => match self.mode {
                 Mode::Normal if self.active_pane == Pane::Content => {
                     vec![
-                        ("1", "Files"),
-                        ("2", "Settings"),
                         ("q", "Quit"),
                         ("Tab", "Files"),
                         ("j/k", "Scroll"),
@@ -521,8 +512,6 @@ impl App {
                 }
                 Mode::Normal => {
                     vec![
-                        ("1", "Files"),
-                        ("2", "Settings"),
                         ("q", "Quit"),
                         ("Tab", "Content"),
                         ("j/k", "Navigate"),
@@ -547,10 +536,6 @@ impl App {
             }
             Screen::Library => {
                 vec![
-                    ("1", "Files"),
-                    ("2", "Settings"),
-                    ("3", "Compose"),
-                    ("4", "Library"),
                     ("j/k", "Navigate"),
                     ("e", "Edit"),
                     ("r", "Rename"),
