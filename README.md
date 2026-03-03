@@ -1,6 +1,8 @@
 # Jigolo
 
-A TUI for browsing and managing [Claude Code](https://claude.com/claude-code) context files (`CLAUDE.md`). Discover files across directory trees, read them in a dual-pane browser, and build a personal snippet library of reusable rules and patterns.
+Your [Claude Code](https://claude.com/claude-code) context files are scattered across dozens of projects and directories. Jigolo finds them all, lets you read them side by side, and helps you build better ones.
+
+It is a terminal app that recursively discovers every `CLAUDE.md` in your directory trees, displays them in a fast dual-pane browser, and gives you tools to work with them: inspect Claude Code settings across all your projects, save the best rules and patterns to a personal snippet library, and compose new `CLAUDE.md` files by picking and assembling snippets from that library.
 
 ## Installation
 
@@ -81,17 +83,17 @@ The TUI has four screens, switched with number keys:
 
 ### Settings Viewer
 
-Press `2` to view Claude Code settings from all discovered files:
+Press `2` to inspect your Claude Code settings across all configuration layers:
 
 - `~/.claude/settings.json` (Global)
 - `.claude/settings.json` (Project)
 - `.claude/settings.local.json` (Project Local)
 
-Displays model, permissions, MCP servers, hooks, plugins, and environment variables in a structured format. Use `←`/`→` to fold/unfold sections and `m` to toggle the merged effective settings view.
+Displays model, permissions, MCP servers, hooks, plugins, and environment variables in a structured, scrollable format. Use `←`/`→` to fold and unfold sections, and `m` to toggle the merged effective settings view that shows the final resolved values after all layers are combined.
 
 ### Snippet Library
 
-Select text you want to reuse across projects:
+Build a personal library of reusable CLAUDE.md rules and patterns:
 
 1. Navigate to a CLAUDE.md file and switch to the content pane (`Tab`)
 2. Move cursor to the start line
@@ -99,16 +101,30 @@ Select text you want to reuse across projects:
 4. Extend selection with arrow keys
 5. Press `s`, type a title, press `Enter`
 
-Snippets are saved to `~/.config/jigolo/library.toml`. Press `4` to browse the library, where you can edit (`e`), rename (`r`), or delete (`d`) saved snippets.
+Snippets are saved to `~/.config/jigolo/library.toml`. Press `4` to open the Library screen, where you can browse all saved snippets in a dual-pane view (titles on the left, content on the right). From there you can edit (`e`) a snippet's content, rename (`r`) its title, or delete (`d`) it.
 
 ### Compose Mode
 
-Assemble new CLAUDE.md files from your snippet library:
+Assemble new CLAUDE.md files by picking snippets from your library:
 
 1. Press `3` to open the Compose screen
-2. Select snippets with `Space` (each selection appends to the preview)
-3. Review the live preview in the right pane
-4. Press `w` to export to a file
+2. Navigate the snippet list and press `Space` to select (each selection appends to the composed output)
+3. Review the live preview in the right pane as you build up the file
+4. Press `w`, type a file path, and press `Enter` to export
+
+Snippets appear in the output in the order you select them, so you control the structure of the resulting file. Deselecting a snippet removes it from the preview.
+
+### Configuration
+
+Jigolo stores its configuration at `~/.config/jigolo/config.toml`:
+
+```toml
+theme = "dark"              # "dark" or "light"
+default_paths = ["/path1"]  # directories to scan on startup
+default_depth = 3           # max directory depth (default: 3)
+```
+
+All settings are optional. CLI arguments override config file values.
 
 ## License
 
