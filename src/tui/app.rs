@@ -471,7 +471,7 @@ impl App {
                     ("2", "Settings"),
                     ("3", "Compose"),
                     ("Space", "Toggle"),
-                    ("p", "Preview"),
+                    ("Tab", "Preview"),
                     ("w", "Export"),
                     ("j/k", "Navigate"),
                     ("q", "Quit"),

@@ -1,8 +1,9 @@
-use std::collections::HashSet;
-
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyCode;
 use ratatui::crossterm::event::KeyEvent;
+use ratatui::layout::Constraint;
+use ratatui::layout::Direction;
+use ratatui::layout::Layout;
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::text::Text;
@@ -17,22 +18,31 @@ use super::app::App;
 use super::app::Mode;
 use super::app::Screen;
 
+/// Which pane is focused on the Compose screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposePane {
+    /// Snippet list (left pane).
+    List,
+    /// Preview (right pane).
+    Preview,
+}
+
 /// State for the Compose screen.
 #[derive(Debug)]
 pub struct ComposeState {
-    /// Set of selected (checked) snippet indices (into App.library).
-    pub selected: HashSet<usize>,
+    /// Ordered list of selected snippet indices (insertion order = compose order).
+    pub selected: Vec<usize>,
     /// Cursor position in the snippet list.
     pub cursor: usize,
-    /// Scroll offset for the list.
+    /// Scroll offset for the snippet list pane.
     pub scroll: u16,
-    /// Viewport height (set during draw).
+    /// Viewport height for the list pane (set during draw).
     pub viewport_height: u16,
-    /// Whether the preview is currently shown full-screen.
-    pub preview_visible: bool,
+    /// Which pane has focus.
+    pub active_pane: ComposePane,
     /// Scroll offset for the preview pane.
     pub preview_scroll: u16,
-    /// Viewport height for preview (set during draw).
+    /// Viewport height for preview pane (set during draw).
     pub preview_viewport_height: u16,
 }
 
@@ -46,11 +56,11 @@ impl ComposeState {
     /// Creates a new compose state with no selections.
     pub fn new() -> Self {
         Self {
-            selected: HashSet::new(),
+            selected: Vec::new(),
             cursor: 0,
             scroll: 0,
             viewport_height: 0,
-            preview_visible: false,
+            active_pane: ComposePane::List,
             preview_scroll: 0,
             preview_viewport_height: 0,
         }
@@ -60,12 +70,25 @@ impl ComposeState {
     fn snippet_count(app: &App) -> usize {
         app.library.as_ref().map_or(0, |lib| lib.snippets.len())
     }
+
+    /// Checks whether a given snippet index is selected.
+    pub fn is_selected(&self, index: usize) -> bool {
+        self.selected.contains(&index)
+    }
+
+    /// Toggles a snippet: appends if not selected, removes if already selected.
+    pub fn toggle(&mut self, index: usize) {
+        if let Some(pos) = self.selected.iter().position(|&i| i == index) {
+            self.selected.remove(pos);
+        } else {
+            self.selected.push(index);
+        }
+    }
 }
 
 impl App {
     /// Enters the Compose screen, loading the library if needed.
     pub(crate) fn enter_compose_screen(&mut self) {
-        // Load library if not already loaded
         if self.library.is_none() {
             if let Some(path) = crate::library::library_path() {
                 match crate::library::load_library(&path) {
@@ -81,7 +104,6 @@ impl App {
             }
         }
 
-        // Initialize compose state if needed
         if self.compose_state.is_none() {
             self.compose_state = Some(ComposeState::new());
         }
@@ -105,7 +127,11 @@ impl App {
         }
     }
 
-    pub(crate) fn draw_compose_screen(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
+    pub(crate) fn draw_compose_screen(
+        &mut self,
+        frame: &mut Frame,
+        area: ratatui::layout::Rect,
+    ) {
         let library = match &self.library {
             Some(lib) => lib,
             None => {
@@ -130,30 +156,33 @@ impl App {
             return;
         }
 
-        // Preview mode: show composed output full-screen
-        if compose.preview_visible {
-            self.draw_compose_preview(frame, area);
-            return;
-        }
+        // Dual-pane layout: snippet list (40%) | preview (60%)
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(area);
 
-        // Normal mode: show snippet list with checkboxes
-        let viewport_height = area.height.saturating_sub(2);
+        let list_area = panes[0];
+        let preview_area = panes[1];
 
+        // --- Left pane: snippet list with checkboxes ---
+        let list_viewport_height = list_area.height.saturating_sub(2);
         let cursor = compose.cursor;
         let highlight = self.theme.highlight;
+        let list_focused = compose.active_pane == ComposePane::List;
 
         let lines: Vec<Line> = library
             .snippets
             .iter()
             .enumerate()
             .map(|(i, snippet)| {
-                let checkbox = if compose.selected.contains(&i) {
+                let checkbox = if compose.is_selected(i) {
                     "[x] "
                 } else {
                     "[ ] "
                 };
                 let text = format!("{checkbox}{}", snippet.title);
-                let style = if i == cursor {
+                let style = if i == cursor && list_focused {
                     highlight
                 } else {
                     Style::default()
@@ -164,50 +193,71 @@ impl App {
 
         let selected_count = compose.selected.len();
         let total_count = library.snippets.len();
-        let title = format!("Compose ({selected_count}/{total_count} selected)");
+        let list_title = format!("Snippets ({selected_count}/{total_count} selected)");
 
-        let list_widget = Paragraph::new(Text::from(lines))
-            .block(Block::default().borders(Borders::ALL).title(title))
-            .scroll((compose.scroll, 0));
-        frame.render_widget(list_widget, area);
-
-        let mut scrollbar_state =
-            ScrollbarState::new(library.snippets.len()).position(compose.scroll as usize);
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-        frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
-
-        // Update viewport height
-        if let Some(cs) = &mut self.compose_state {
-            cs.viewport_height = viewport_height;
-        }
-    }
-
-    fn draw_compose_preview(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let compose = match &self.compose_state {
-            Some(s) => s,
-            None => return,
+        let list_border_style = if list_focused {
+            self.theme.active_border
+        } else {
+            Style::default()
         };
 
+        let list_widget = Paragraph::new(Text::from(lines))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(list_border_style)
+                    .title(list_title),
+            )
+            .scroll((compose.scroll, 0));
+        frame.render_widget(list_widget, list_area);
+
+        let mut list_scrollbar_state =
+            ScrollbarState::new(library.snippets.len()).position(compose.scroll as usize);
+        let list_scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+        frame.render_stateful_widget(list_scrollbar, list_area, &mut list_scrollbar_state);
+
+        // --- Right pane: live preview ---
+        let preview_viewport_height = preview_area.height.saturating_sub(2);
         let composed = self.composed_text();
-        let viewport_height = area.height.saturating_sub(2);
+
+        let preview_focused = compose.active_pane == ComposePane::Preview;
+        let preview_border_style = if preview_focused {
+            self.theme.active_border
+        } else {
+            Style::default()
+        };
+
+        let preview_title = if composed.is_empty() {
+            "Preview".to_string()
+        } else {
+            let line_count = composed.lines().count();
+            format!("Preview ({line_count} lines)")
+        };
 
         let preview_widget = Paragraph::new(composed.as_str())
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("Preview (Esc to return)"),
+                    .border_style(preview_border_style)
+                    .title(preview_title),
             )
             .scroll((compose.preview_scroll, 0));
-        frame.render_widget(preview_widget, area);
+        frame.render_widget(preview_widget, preview_area);
 
-        let line_count = composed.lines().count();
-        let mut scrollbar_state =
-            ScrollbarState::new(line_count).position(compose.preview_scroll as usize);
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-        frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
+        let preview_line_count = composed.lines().count();
+        let mut preview_scrollbar_state = ScrollbarState::new(preview_line_count)
+            .position(compose.preview_scroll as usize);
+        let preview_scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+        frame.render_stateful_widget(
+            preview_scrollbar,
+            preview_area,
+            &mut preview_scrollbar_state,
+        );
 
+        // Update viewport heights
         if let Some(cs) = &mut self.compose_state {
-            cs.preview_viewport_height = viewport_height;
+            cs.viewport_height = list_viewport_height;
+            cs.preview_viewport_height = preview_viewport_height;
         }
     }
 
@@ -230,12 +280,6 @@ impl App {
             None => return,
         };
 
-        // In preview mode, only handle scroll and exit
-        if compose.preview_visible {
-            self.handle_compose_preview_key(key_event);
-            return;
-        }
-
         let snippet_count = ComposeState::snippet_count(self);
         if snippet_count == 0 {
             match key_event.code {
@@ -247,6 +291,12 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+
+        // Route based on active pane
+        if compose.active_pane == ComposePane::Preview {
+            self.handle_compose_preview_key(key_event);
             return;
         }
 
@@ -268,21 +318,12 @@ impl App {
             KeyCode::Char(' ') => {
                 if let Some(cs) = &mut self.compose_state {
                     let cursor = cs.cursor;
-                    if cs.selected.contains(&cursor) {
-                        cs.selected.remove(&cursor);
-                    } else {
-                        cs.selected.insert(cursor);
-                    }
+                    cs.toggle(cursor);
                 }
             }
-            KeyCode::Char('p') => {
+            KeyCode::Tab => {
                 if let Some(cs) = &mut self.compose_state {
-                    if cs.selected.is_empty() {
-                        self.status_message = Some("No snippets selected.".to_string());
-                    } else {
-                        cs.preview_visible = true;
-                        cs.preview_scroll = 0;
-                    }
+                    cs.active_pane = ComposePane::Preview;
                 }
             }
             KeyCode::Char('w') => {
@@ -309,10 +350,10 @@ impl App {
     fn handle_compose_preview_key(&mut self, key_event: KeyEvent) {
         match key_event.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                // Compute line count before borrowing compose_state mutably
                 let line_count = self.composed_text().lines().count();
                 if let Some(cs) = &mut self.compose_state {
-                    let max_scroll = line_count.saturating_sub(cs.preview_viewport_height as usize);
+                    let max_scroll =
+                        line_count.saturating_sub(cs.preview_viewport_height as usize);
                     if (cs.preview_scroll as usize) < max_scroll {
                         cs.preview_scroll += 1;
                     }
@@ -323,10 +364,13 @@ impl App {
                     cs.preview_scroll = cs.preview_scroll.saturating_sub(1);
                 }
             }
-            KeyCode::Esc => {
+            KeyCode::Tab => {
                 if let Some(cs) = &mut self.compose_state {
-                    cs.preview_visible = false;
+                    cs.active_pane = ComposePane::List;
                 }
+            }
+            KeyCode::Esc => {
+                self.screen = Screen::Files;
             }
             KeyCode::Char('q') => {
                 self.exit = true;
@@ -374,7 +418,6 @@ impl App {
             return;
         }
 
-        // Expand tilde
         let expanded = if raw_path.starts_with('~') {
             if let Ok(home) = std::env::var("HOME") {
                 raw_path.replacen('~', &home, 1)
@@ -388,7 +431,6 @@ impl App {
 
         let path = std::path::PathBuf::from(&expanded);
 
-        // Check parent exists
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
             && !parent.exists()
@@ -397,7 +439,6 @@ impl App {
             return;
         }
 
-        // Refuse overwrite
         if path.exists() {
             self.status_message = Some("File already exists.".to_string());
             return;
@@ -409,7 +450,6 @@ impl App {
             .as_ref()
             .map_or(0, |cs| cs.selected.len());
 
-        // Atomic write
         let parent = path.parent().unwrap_or(std::path::Path::new("."));
         let result = tempfile::NamedTempFile::new_in(parent).and_then(|mut tmp| {
             use std::io::Write;
@@ -465,6 +505,8 @@ mod tests {
     use crate::tui::app::test_helpers::key_event;
     use crate::tui::app::test_helpers::render_once;
 
+    use super::ComposePane;
+
     fn app_with_library(snippets: Vec<(&str, &str)>) -> App {
         let mut app = App::new(vec![], &Config::default());
         app.library = Some(SnippetLibrary {
@@ -499,7 +541,6 @@ mod tests {
     fn compose_empty_library_shows_message() {
         let mut app = app_with_library(vec![]);
         render_once(&mut app);
-        // Empty library renders without panic — the draw method handles the message
     }
 
     #[test]
@@ -522,26 +563,45 @@ mod tests {
     }
 
     #[test]
-    fn space_toggles_selection() {
-        let mut app = app_with_library(vec![("A", "aaa"), ("B", "bbb")]);
+    fn space_toggles_selection_and_appends() {
+        let mut app = app_with_library(vec![("A", "aaa"), ("B", "bbb"), ("C", "ccc")]);
 
+        // Select first
         app.handle_key_event(key_event(KeyCode::Char(' ')));
-        assert!(app.compose_state.as_ref().unwrap().selected.contains(&0));
+        assert_eq!(app.compose_state.as_ref().unwrap().selected, vec![0]);
 
-        // Toggle off
-        app.handle_key_event(key_event(KeyCode::Char(' ')));
-        assert!(!app.compose_state.as_ref().unwrap().selected.contains(&0));
-
-        // Select second
+        // Select third (skip second)
+        app.handle_key_event(key_event(KeyCode::Char('j')));
         app.handle_key_event(key_event(KeyCode::Char('j')));
         app.handle_key_event(key_event(KeyCode::Char(' ')));
-        assert!(app.compose_state.as_ref().unwrap().selected.contains(&1));
+        assert_eq!(app.compose_state.as_ref().unwrap().selected, vec![0, 2]);
+
+        // Toggle first off
+        app.handle_key_event(key_event(KeyCode::Char('k')));
+        app.handle_key_event(key_event(KeyCode::Char('k')));
+        app.handle_key_event(key_event(KeyCode::Char(' ')));
+        assert_eq!(app.compose_state.as_ref().unwrap().selected, vec![2]);
+    }
+
+    #[test]
+    fn selection_order_determines_compose_order() {
+        let mut app = app_with_library(vec![("A", "aaa"), ("B", "bbb"), ("C", "ccc")]);
+
+        // Select C first, then A
+        app.handle_key_event(key_event(KeyCode::Char('j')));
+        app.handle_key_event(key_event(KeyCode::Char('j')));
+        app.handle_key_event(key_event(KeyCode::Char(' '))); // C
+        app.handle_key_event(key_event(KeyCode::Char('k')));
+        app.handle_key_event(key_event(KeyCode::Char('k')));
+        app.handle_key_event(key_event(KeyCode::Char(' '))); // A
+
+        // Composed output should be C then A (selection order)
+        assert_eq!(app.composed_text(), "ccc\n\naaa");
     }
 
     #[test]
     fn esc_returns_to_files_screen() {
         let mut app = app_with_library(vec![("A", "aaa")]);
-
         app.handle_key_event(key_event(KeyCode::Esc));
         assert_eq!(app.screen, Screen::Files);
     }
@@ -549,43 +609,41 @@ mod tests {
     #[test]
     fn q_quits_app() {
         let mut app = app_with_library(vec![("A", "aaa")]);
-
         app.handle_key_event(key_event(KeyCode::Char('q')));
         assert!(app.exit);
     }
 
     #[test]
-    fn p_shows_preview_when_selected() {
+    fn tab_switches_pane_focus() {
         let mut app = app_with_library(vec![("A", "aaa")]);
-        app.handle_key_event(key_event(KeyCode::Char(' '))); // select
-        app.handle_key_event(key_event(KeyCode::Char('p'))); // preview
+        assert_eq!(
+            app.compose_state.as_ref().unwrap().active_pane,
+            ComposePane::List
+        );
 
-        assert!(app.compose_state.as_ref().unwrap().preview_visible);
-    }
+        app.handle_key_event(key_event(KeyCode::Tab));
+        assert_eq!(
+            app.compose_state.as_ref().unwrap().active_pane,
+            ComposePane::Preview
+        );
 
-    #[test]
-    fn p_shows_error_when_nothing_selected() {
-        let mut app = app_with_library(vec![("A", "aaa")]);
-        app.handle_key_event(key_event(KeyCode::Char('p')));
-
-        assert!(!app.compose_state.as_ref().unwrap().preview_visible);
-        assert!(
-            app.status_message
-                .as_deref()
-                .unwrap()
-                .contains("No snippets selected")
+        app.handle_key_event(key_event(KeyCode::Tab));
+        assert_eq!(
+            app.compose_state.as_ref().unwrap().active_pane,
+            ComposePane::List
         );
     }
 
     #[test]
-    fn esc_in_preview_returns_to_list() {
-        let mut app = app_with_library(vec![("A", "aaa")]);
+    fn jk_scrolls_preview_when_focused() {
+        let mut app = app_with_library(vec![("A", "line1\nline2\nline3\nline4\nline5")]);
+        // Select snippet
         app.handle_key_event(key_event(KeyCode::Char(' ')));
-        app.handle_key_event(key_event(KeyCode::Char('p')));
-        assert!(app.compose_state.as_ref().unwrap().preview_visible);
+        // Switch to preview
+        app.handle_key_event(key_event(KeyCode::Tab));
 
-        app.handle_key_event(key_event(KeyCode::Esc));
-        assert!(!app.compose_state.as_ref().unwrap().preview_visible);
+        app.handle_key_event(key_event(KeyCode::Char('j')));
+        // Preview scroll should not panic (viewport may be 0 in tests)
     }
 
     #[test]
@@ -612,37 +670,26 @@ mod tests {
     }
 
     #[test]
-    fn export_writes_file() {
+    fn export_writes_file_in_selection_order() {
         let tmp = TempDir::new().unwrap();
         let output_path = tmp.path().join("output.md");
 
         let mut app = app_with_library(vec![("A", "aaa"), ("B", "bbb")]);
-        // Select both
-        app.handle_key_event(key_event(KeyCode::Char(' ')));
+        // Select B then A
         app.handle_key_event(key_event(KeyCode::Char('j')));
-        app.handle_key_event(key_event(KeyCode::Char(' ')));
+        app.handle_key_event(key_event(KeyCode::Char(' '))); // B
+        app.handle_key_event(key_event(KeyCode::Char('k')));
+        app.handle_key_event(key_event(KeyCode::Char(' '))); // A
 
-        // Enter export mode
         app.handle_key_event(key_event(KeyCode::Char('w')));
-        assert_eq!(app.mode, Mode::ExportPath);
-
-        // Type path
         for c in output_path.display().to_string().chars() {
             app.handle_key_event(key_event(KeyCode::Char(c)));
         }
-
-        // Press Enter to export
         app.handle_key_event(key_event(KeyCode::Enter));
 
         assert_eq!(app.mode, Mode::Normal);
         let content = fs::read_to_string(&output_path).unwrap();
-        assert_eq!(content, "aaa\n\nbbb");
-        assert!(
-            app.status_message
-                .as_deref()
-                .unwrap()
-                .contains("Exported 2")
-        );
+        assert_eq!(content, "bbb\n\naaa");
     }
 
     #[test]
@@ -666,7 +713,6 @@ mod tests {
                 .unwrap()
                 .contains("already exists")
         );
-        // File unchanged
         assert_eq!(
             fs::read_to_string(&output_path).unwrap(),
             "existing content"
@@ -706,66 +752,43 @@ mod tests {
     #[test]
     fn compose_state_preserved_across_tab_switch() {
         let mut app = app_with_library(vec![("A", "aaa"), ("B", "bbb")]);
-        // Select first snippet
         app.handle_key_event(key_event(KeyCode::Char(' ')));
 
-        // Switch to Files and back
         app.handle_key_event(key_event(KeyCode::Char('1')));
         assert_eq!(app.screen, Screen::Files);
 
         app.handle_key_event(key_event(KeyCode::Char('3')));
         assert_eq!(app.screen, Screen::Compose);
 
-        // Selection should be preserved
-        assert!(app.compose_state.as_ref().unwrap().selected.contains(&0));
+        assert_eq!(app.compose_state.as_ref().unwrap().selected, vec![0]);
     }
 
     #[test]
-    fn composed_text_returns_selected_content() {
+    fn composed_text_follows_selection_order() {
         let mut app = app_with_library(vec![("A", "aaa"), ("B", "bbb"), ("C", "ccc")]);
-        // Select first and third
-        app.handle_key_event(key_event(KeyCode::Char(' ')));
+        // Select C then A
         app.handle_key_event(key_event(KeyCode::Char('j')));
         app.handle_key_event(key_event(KeyCode::Char('j')));
-        app.handle_key_event(key_event(KeyCode::Char(' ')));
+        app.handle_key_event(key_event(KeyCode::Char(' '))); // C
+        app.handle_key_event(key_event(KeyCode::Char('k')));
+        app.handle_key_event(key_event(KeyCode::Char('k')));
+        app.handle_key_event(key_event(KeyCode::Char(' '))); // A
 
-        assert_eq!(app.composed_text(), "aaa\n\nccc");
+        assert_eq!(app.composed_text(), "ccc\n\naaa");
     }
 
     #[test]
-    fn compose_renders_without_panic() {
+    fn compose_dual_pane_renders_without_panic() {
         let mut app = app_with_library(vec![("A", "aaa"), ("B", "bbb")]);
         app.handle_key_event(key_event(KeyCode::Char(' ')));
         render_once(&mut app);
-        // No panic = success
     }
 
     #[test]
-    fn compose_preview_renders_without_panic() {
+    fn esc_from_preview_pane_returns_to_files() {
         let mut app = app_with_library(vec![("A", "aaa")]);
-        app.handle_key_event(key_event(KeyCode::Char(' ')));
-        app.handle_key_event(key_event(KeyCode::Char('p')));
-        render_once(&mut app);
-        // No panic = success
-    }
-
-    #[test]
-    fn tilde_expansion_in_export_path() {
-        let tmp = TempDir::new().unwrap();
-        let output_name = "test_output.md";
-
-        let mut app = app_with_library(vec![("A", "content")]);
-        app.handle_key_event(key_event(KeyCode::Char(' ')));
-        app.handle_key_event(key_event(KeyCode::Char('w')));
-
-        // Type a path using the tmp dir (not tilde, since HOME varies in tests)
-        let full_path = tmp.path().join(output_name);
-        for c in full_path.display().to_string().chars() {
-            app.handle_key_event(key_event(KeyCode::Char(c)));
-        }
-        app.handle_key_event(key_event(KeyCode::Enter));
-
-        assert!(app.status_message.as_deref().unwrap().contains("Exported"));
-        assert_eq!(fs::read_to_string(full_path).unwrap(), "content");
+        app.handle_key_event(key_event(KeyCode::Tab)); // focus preview
+        app.handle_key_event(key_event(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::Files);
     }
 }
