@@ -27,6 +27,7 @@ use tui_tree_widget::TreeState;
 use crate::library::SnippetLibrary;
 use crate::model::SourceRoot;
 use crate::settings::SettingsCollection;
+use crate::settings::SettingsEntry;
 use crate::settings::SettingsLineMap;
 use crate::tui::theme::Theme;
 
@@ -153,6 +154,7 @@ impl ContentState {
 pub struct SettingsState {
     pub lines: Vec<String>,
     pub line_map: SettingsLineMap,
+    pub entry_map: Vec<SettingsEntry>,
     pub scroll: u16,
     pub cursor: usize,
     pub viewport_height: u16,
@@ -160,6 +162,8 @@ pub struct SettingsState {
     pub merged_view: bool,
     /// Indices of section header lines that are currently collapsed.
     pub collapsed: HashSet<usize>,
+    /// Target for add-permission input: (file_idx, category).
+    pub add_target: Option<(usize, String)>,
 }
 
 impl SettingsState {
@@ -478,6 +482,9 @@ impl App {
             Screen::Settings if self.mode == Mode::Edit => {
                 vec![("Ctrl+S", "Save"), ("Esc", "Cancel")]
             }
+            Screen::Settings if self.mode == Mode::TitleInput => {
+                vec![("Enter", "Add"), ("Esc", "Cancel")]
+            }
             Screen::Settings if self.settings_state.merged_view => {
                 vec![
                     ("m", "Per-file"),
@@ -488,14 +495,37 @@ impl App {
                 ]
             }
             Screen::Settings => {
-                vec![
-                    ("e", "Edit"),
-                    ("m", "Merge"),
+                let mut pairs = vec![("e", "Edit"), ("m", "Merge")];
+                // Context-sensitive hints based on entry at cursor
+                if let Some(entry) = self
+                    .settings_state
+                    .entry_map
+                    .get(self.settings_state.cursor)
+                {
+                    match entry {
+                        SettingsEntry::BooleanField { .. } => {
+                            pairs.push(("Space", "Toggle"));
+                        }
+                        SettingsEntry::PermissionItem { .. } => {
+                            pairs.push(("a", "Add"));
+                            pairs.push(("d", "Remove"));
+                        }
+                        SettingsEntry::PermissionHeader { .. } => {
+                            pairs.push(("a", "Add"));
+                        }
+                        SettingsEntry::McpServer { .. } => {
+                            pairs.push(("d", "Remove"));
+                        }
+                        _ => {}
+                    }
+                }
+                pairs.extend_from_slice(&[
                     ("↑/↓", "Scroll"),
                     ("←/→", "Fold"),
                     ("T", "Theme"),
                     ("q", "Quit"),
-                ]
+                ]);
+                pairs
             }
             Screen::Files => match self.mode {
                 Mode::Normal if self.active_pane == Pane::Content => {
@@ -740,7 +770,13 @@ impl App {
                 Mode::Edit => {}                           // handled above
                 Mode::RenameInput | Mode::ExportPath => {} // not used on Files screen
             },
-            Screen::Settings => self.handle_settings_key(key_event),
+            Screen::Settings => {
+                if self.mode == Mode::TitleInput {
+                    self.handle_settings_add_input_key(key_event);
+                } else {
+                    self.handle_settings_key(key_event);
+                }
+            }
             Screen::Compose => match self.mode {
                 Mode::Normal => self.handle_compose_key(key_event),
                 Mode::ExportPath => self.handle_export_path_key(key_event),

@@ -256,6 +256,246 @@ fn merge_object(
     }
 }
 
+/// Semantic type of a settings display line, enabling type-aware editing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingsEntry {
+    /// Top-level file section header (e.g. "Global (/path)").
+    SectionHeader { file_idx: usize },
+    /// A boolean field (e.g. thinking: true).
+    BooleanField {
+        file_idx: usize,
+        key: String,
+        value: bool,
+    },
+    /// A scalar field (e.g. model: opus).
+    ScalarField {
+        file_idx: usize,
+        key: String,
+        value: String,
+    },
+    /// Permission category header (e.g. "Permissions (allow):").
+    PermissionHeader { file_idx: usize, category: String },
+    /// A single permission entry (e.g. "Read" under allow).
+    PermissionItem {
+        file_idx: usize,
+        category: String,
+        value: String,
+    },
+    /// MCP Servers section header.
+    McpServerHeader { file_idx: usize },
+    /// A single MCP server entry.
+    McpServer { file_idx: usize, name: String },
+    /// A generic sub-section header (hooks, plugins, env).
+    SubHeader { file_idx: usize, key: String },
+    /// A generic leaf line (hook entry, plugin name, env var, etc.).
+    Leaf { file_idx: usize },
+    /// Blank separator between file sections.
+    Blank,
+}
+
+/// Builds the semantic entry map from formatted lines and line_map.
+///
+/// Parses formatted display lines to determine the semantic type of each line.
+/// The result is parallel to `lines` — same length, same indices.
+pub fn build_entry_map(
+    lines: &[String],
+    line_map: &SettingsLineMap,
+    _collection: &SettingsCollection,
+) -> Vec<SettingsEntry> {
+    let mut entries = Vec::with_capacity(lines.len());
+    let mut current_permission_category: Option<String> = None;
+    let mut in_mcp_servers = false;
+    let mut in_sub_section: Option<String> = None;
+
+    for (i, line) in lines.iter().enumerate() {
+        let file_idx = match line_map.get(i).copied().flatten() {
+            Some(idx) => idx,
+            None => {
+                entries.push(SettingsEntry::Blank);
+                current_permission_category = None;
+                in_mcp_servers = false;
+                in_sub_section = None;
+                continue;
+            }
+        };
+
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        let is_header = trimmed.starts_with('▾') || trimmed.starts_with('▸');
+
+        // Header lines (▾/▸)
+        if is_header {
+            current_permission_category = None;
+            in_mcp_servers = false;
+            in_sub_section = None;
+
+            if indent > 0 {
+                // Indented header — determine type from content
+                if trimmed.contains("Permissions (")
+                    && let Some(cat) = extract_permission_category(trimmed)
+                {
+                    current_permission_category = Some(cat.clone());
+                    entries.push(SettingsEntry::PermissionHeader {
+                        file_idx,
+                        category: cat,
+                    });
+                    continue;
+                }
+                if trimmed.contains("MCP Servers:") {
+                    in_mcp_servers = true;
+                    entries.push(SettingsEntry::McpServerHeader { file_idx });
+                    continue;
+                }
+                // Generic sub-header (Hooks, Plugins, Env)
+                let key = trimmed
+                    .trim_start_matches('▾')
+                    .trim_start_matches('▸')
+                    .trim()
+                    .trim_end_matches(':')
+                    .to_string();
+                in_sub_section = Some(key.clone());
+                entries.push(SettingsEntry::SubHeader { file_idx, key });
+                continue;
+            }
+
+            // Top-level file header
+            entries.push(SettingsEntry::SectionHeader { file_idx });
+            continue;
+        }
+
+        // Content lines (indented, not headers)
+        let trimmed = line.trim();
+
+        // Inside permission section
+        if let Some(ref cat) = current_permission_category {
+            if !trimmed.is_empty() && !trimmed.contains(':') {
+                entries.push(SettingsEntry::PermissionItem {
+                    file_idx,
+                    category: cat.clone(),
+                    value: trimmed.to_string(),
+                });
+                continue;
+            }
+            // New key:value line means we left the permission section
+            current_permission_category = None;
+        }
+
+        // Inside MCP servers section
+        if in_mcp_servers {
+            if let Some(name) = extract_mcp_server_name(trimmed) {
+                entries.push(SettingsEntry::McpServer { file_idx, name });
+                continue;
+            }
+            in_mcp_servers = false;
+        }
+
+        // Inside generic sub-section
+        if in_sub_section.is_some() {
+            if !trimmed.is_empty() {
+                entries.push(SettingsEntry::Leaf { file_idx });
+                continue;
+            }
+            in_sub_section = None;
+        }
+
+        // Scalar or boolean field
+        if let Some((key, val_str)) = parse_scalar_line(trimmed) {
+            match val_str.as_str() {
+                "true" | "false" => {
+                    entries.push(SettingsEntry::BooleanField {
+                        file_idx,
+                        key,
+                        value: val_str == "true",
+                    });
+                }
+                _ => {
+                    entries.push(SettingsEntry::ScalarField {
+                        file_idx,
+                        key: key.clone(),
+                        value: val_str,
+                    });
+                }
+            }
+            // Check if this scalar is followed by permission/mcp content
+            continue;
+        }
+
+        // Fallback
+        entries.push(SettingsEntry::Leaf { file_idx });
+    }
+
+    entries
+}
+
+/// Extracts the permission category from a header like "▾ Permissions (allow):".
+fn extract_permission_category(trimmed: &str) -> Option<String> {
+    let start = trimmed.find("Permissions (")?;
+    let after = &trimmed[start + "Permissions (".len()..];
+    let end = after.find(')')?;
+    Some(after[..end].to_string())
+}
+
+/// Extracts the MCP server name from a line like "rust-cargo: npx ...".
+fn extract_mcp_server_name(trimmed: &str) -> Option<String> {
+    let colon = trimmed.find(':')?;
+    if colon == 0 {
+        return None;
+    }
+    Some(trimmed[..colon].to_string())
+}
+
+/// Parses a scalar display line like "Model: opus" into (key, value).
+fn parse_scalar_line(trimmed: &str) -> Option<(String, String)> {
+    // Map display labels back to JSON keys
+    let key_mappings: &[(&str, &str)] = &[
+        ("Model: ", "model"),
+        ("Default Mode: ", "defaultMode"),
+        ("Thinking: ", "thinking"),
+    ];
+
+    for &(prefix, json_key) in key_mappings {
+        if let Some(val) = trimmed.strip_prefix(prefix) {
+            return Some((json_key.to_string(), val.to_string()));
+        }
+    }
+
+    // Generic "key: value" pattern for unknown scalars
+    if let Some(colon_pos) = trimmed.find(": ") {
+        let key = trimmed[..colon_pos].to_string();
+        let val = trimmed[colon_pos + 2..].to_string();
+        // Skip lines that look like sub-section content (e.g. "preCommit: cargo fmt")
+        if !key.contains(' ') {
+            return Some((key, val));
+        }
+    }
+
+    None
+}
+
+/// Writes a settings JSON value back to a file atomically.
+///
+/// Pretty-prints the JSON with 2-space indentation and a trailing newline.
+pub fn write_settings_file(path: &Path, value: &serde_json::Value) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let json = serde_json::to_string_pretty(value)
+        .map_err(|e| anyhow::anyhow!("failed to serialize settings: {e}"))?;
+    let content = format!("{json}\n");
+
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| anyhow::anyhow!("failed to create temp file: {e}"))?;
+    let mut file = tmp;
+    file.write_all(content.as_bytes())
+        .map_err(|e| anyhow::anyhow!("failed to write temp file: {e}"))?;
+    file.flush()
+        .map_err(|e| anyhow::anyhow!("failed to flush temp file: {e}"))?;
+    file.persist(path)
+        .map_err(|e| anyhow::anyhow!("failed to persist settings file: {e}"))?;
+
+    Ok(())
+}
+
 fn format_key_value(key: &str, val: &serde_json::Value, lines: &mut Vec<String>) {
     match key {
         "model" => {
@@ -668,6 +908,192 @@ mod tests {
                 },
             ],
         }
+    }
+
+    // --- build_entry_map tests ---
+
+    #[test]
+    fn entry_map_identifies_section_header() {
+        let collection = collection_from_json(r#"{"model":"opus"}"#);
+        let (lines, line_map) = format_settings_with_map(&collection);
+        let entries = build_entry_map(&lines, &line_map, &collection);
+
+        assert_eq!(entries[0], SettingsEntry::SectionHeader { file_idx: 0 });
+    }
+
+    #[test]
+    fn entry_map_identifies_boolean_field() {
+        let collection = collection_from_json(r#"{"thinking":true}"#);
+        let (lines, line_map) = format_settings_with_map(&collection);
+        let entries = build_entry_map(&lines, &line_map, &collection);
+
+        let bool_entry = entries
+            .iter()
+            .find(|e| matches!(e, SettingsEntry::BooleanField { key, .. } if key == "thinking"));
+        assert!(
+            bool_entry.is_some(),
+            "Should find BooleanField for thinking, got: {:?}",
+            entries
+        );
+        if let Some(SettingsEntry::BooleanField { value, .. }) = bool_entry {
+            assert!(*value);
+        }
+    }
+
+    #[test]
+    fn entry_map_identifies_scalar_field() {
+        let collection = collection_from_json(r#"{"model":"opus"}"#);
+        let (lines, line_map) = format_settings_with_map(&collection);
+        let entries = build_entry_map(&lines, &line_map, &collection);
+
+        let scalar = entries
+            .iter()
+            .find(|e| matches!(e, SettingsEntry::ScalarField { key, .. } if key == "model"));
+        assert!(
+            scalar.is_some(),
+            "Should find ScalarField, got: {:?}",
+            entries
+        );
+    }
+
+    #[test]
+    fn entry_map_identifies_permission_header_and_items() {
+        let collection = collection_from_json(r#"{"permissions":{"allow":["Read","Write"]}}"#);
+        let (lines, line_map) = format_settings_with_map(&collection);
+        let entries = build_entry_map(&lines, &line_map, &collection);
+
+        let perm_header = entries.iter().find(|e| {
+            matches!(e, SettingsEntry::PermissionHeader { category, .. } if category == "allow")
+        });
+        assert!(
+            perm_header.is_some(),
+            "Should find PermissionHeader, got: {:?}",
+            entries
+        );
+
+        let perm_items: Vec<_> = entries
+            .iter()
+            .filter(|e| matches!(e, SettingsEntry::PermissionItem { category, .. } if category == "allow"))
+            .collect();
+        assert_eq!(
+            perm_items.len(),
+            2,
+            "Should find 2 PermissionItems, got: {:?}",
+            entries
+        );
+    }
+
+    #[test]
+    fn entry_map_identifies_mcp_servers() {
+        let collection = collection_from_json(
+            r#"{"mcpServers":{"rust-cargo":{"command":"npx"},"ctx7":{"command":"node"}}}"#,
+        );
+        let (lines, line_map) = format_settings_with_map(&collection);
+        let entries = build_entry_map(&lines, &line_map, &collection);
+
+        let mcp_header = entries
+            .iter()
+            .find(|e| matches!(e, SettingsEntry::McpServerHeader { .. }));
+        assert!(
+            mcp_header.is_some(),
+            "Should find McpServerHeader, got: {:?}",
+            entries
+        );
+
+        let servers: Vec<_> = entries
+            .iter()
+            .filter(|e| matches!(e, SettingsEntry::McpServer { .. }))
+            .collect();
+        assert_eq!(
+            servers.len(),
+            2,
+            "Should find 2 McpServer entries, got: {:?}",
+            entries
+        );
+    }
+
+    #[test]
+    fn entry_map_identifies_blank_separators() {
+        let collection = SettingsCollection {
+            files: vec![
+                SettingsFile {
+                    label: "Global".to_string(),
+                    path: PathBuf::from("/global"),
+                    value: serde_json::json!({"model": "opus"}),
+                },
+                SettingsFile {
+                    label: "Project".to_string(),
+                    path: PathBuf::from("/project"),
+                    value: serde_json::json!({"model": "haiku"}),
+                },
+            ],
+        };
+        let (lines, line_map) = format_settings_with_map(&collection);
+        let entries = build_entry_map(&lines, &line_map, &collection);
+
+        let blank_count = entries
+            .iter()
+            .filter(|e| matches!(e, SettingsEntry::Blank))
+            .count();
+        assert!(blank_count > 0, "Should have blank separators");
+    }
+
+    #[test]
+    fn entry_map_length_matches_lines() {
+        let collection = collection_from_json(
+            r#"{"model":"opus","thinking":true,"permissions":{"allow":["Read"]},"mcpServers":{"cargo":{"command":"npx"}}}"#,
+        );
+        let (lines, line_map) = format_settings_with_map(&collection);
+        let entries = build_entry_map(&lines, &line_map, &collection);
+
+        assert_eq!(
+            entries.len(),
+            lines.len(),
+            "Entry map length should match lines length"
+        );
+    }
+
+    // --- write_settings_file tests ---
+
+    #[test]
+    fn write_settings_file_creates_valid_json() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+        let value = serde_json::json!({"model": "opus", "thinking": true});
+
+        write_settings_file(&path, &value).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed.get("model").unwrap().as_str().unwrap(), "opus");
+        assert!(parsed.get("thinking").unwrap().as_bool().unwrap());
+    }
+
+    #[test]
+    fn write_settings_file_has_trailing_newline() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+        let value = serde_json::json!({"model": "opus"});
+
+        write_settings_file(&path, &value).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.ends_with('\n'), "Should have trailing newline");
+    }
+
+    #[test]
+    fn write_settings_file_overwrites_existing() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("settings.json");
+        fs::write(&path, r#"{"old":"value"}"#).unwrap();
+
+        let value = serde_json::json!({"new": "value"});
+        write_settings_file(&path, &value).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed.get("old").is_none());
+        assert_eq!(parsed.get("new").unwrap().as_str().unwrap(), "value");
     }
 
     #[test]

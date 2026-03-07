@@ -18,8 +18,11 @@ use super::app::App;
 use super::app::Mode;
 use super::app::Screen;
 use crate::settings::SettingsCollection;
+use crate::settings::SettingsEntry;
 use crate::settings::SettingsFile;
+use crate::settings::build_entry_map;
 use crate::settings::format_settings_with_map;
+use crate::settings::write_settings_file;
 
 impl App {
     pub(crate) fn draw_settings_screen(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
@@ -80,6 +83,23 @@ impl App {
                 self.settings_state.merged_view = !self.settings_state.merged_view;
                 self.rebuild_settings_display();
             }
+            KeyCode::Char(' ') if !self.settings_state.merged_view => {
+                self.toggle_settings_value();
+            }
+            KeyCode::Char(' ') => {
+                self.status_message =
+                    Some("Toggle not available in merged view — press m to switch.".to_string());
+            }
+            KeyCode::Char('d') if !self.settings_state.merged_view => {
+                self.delete_settings_entry();
+            }
+            KeyCode::Char('d') => {
+                self.status_message =
+                    Some("Delete not available in merged view — press m to switch.".to_string());
+            }
+            KeyCode::Char('a') if !self.settings_state.merged_view => {
+                self.start_add_permission();
+            }
             KeyCode::Char('q') => self.exit = true,
             KeyCode::Down | KeyCode::Char('j') => {
                 self.settings_state.cursor_down();
@@ -117,6 +137,187 @@ impl App {
         }
     }
 
+    /// Toggles a boolean field at the cursor.
+    fn toggle_settings_value(&mut self) {
+        let cursor = self.settings_state.cursor;
+        let entry = match self.settings_state.entry_map.get(cursor) {
+            Some(e) => e.clone(),
+            None => return,
+        };
+
+        match entry {
+            SettingsEntry::BooleanField {
+                file_idx,
+                ref key,
+                value,
+            } => {
+                let new_value = !value;
+                if self.mutate_settings_json(file_idx, |obj| {
+                    obj.insert(key.clone(), serde_json::Value::Bool(new_value));
+                }) {
+                    self.status_message = Some(format!("{key} set to {new_value}."));
+                }
+            }
+            _ => {
+                self.status_message = Some("Space toggles boolean fields only.".to_string());
+            }
+        }
+    }
+
+    /// Deletes a permission item or MCP server at the cursor.
+    fn delete_settings_entry(&mut self) {
+        let cursor = self.settings_state.cursor;
+        let entry = match self.settings_state.entry_map.get(cursor) {
+            Some(e) => e.clone(),
+            None => return,
+        };
+
+        match entry {
+            SettingsEntry::PermissionItem {
+                file_idx,
+                ref category,
+                ref value,
+            } => {
+                let cat = category.clone();
+                let val = value.clone();
+                if self.mutate_settings_json(file_idx, |obj| {
+                    if let Some(perms) = obj.get_mut("permissions")
+                        && let Some(perms_obj) = perms.as_object_mut()
+                        && let Some(arr_val) = perms_obj.get_mut(&cat)
+                        && let Some(arr) = arr_val.as_array_mut()
+                    {
+                        arr.retain(|item| item.as_str() != Some(&val));
+                    }
+                }) {
+                    self.status_message = Some(format!("Removed '{val}' from {cat}."));
+                }
+            }
+            SettingsEntry::McpServer { file_idx, ref name } => {
+                let server_name = name.clone();
+                if self.mutate_settings_json(file_idx, |obj| {
+                    if let Some(servers) = obj.get_mut("mcpServers")
+                        && let Some(servers_obj) = servers.as_object_mut()
+                    {
+                        servers_obj.remove(&server_name);
+                    }
+                }) {
+                    self.status_message = Some(format!("Removed MCP server '{server_name}'."));
+                }
+            }
+            _ => {
+                self.status_message =
+                    Some("Delete works on permission items and MCP servers.".to_string());
+            }
+        }
+    }
+
+    /// Starts adding a new permission entry — enters TitleInput mode.
+    fn start_add_permission(&mut self) {
+        let cursor = self.settings_state.cursor;
+        let entry = match self.settings_state.entry_map.get(cursor) {
+            Some(e) => e.clone(),
+            None => return,
+        };
+
+        let (file_idx, category) = match &entry {
+            SettingsEntry::PermissionHeader { file_idx, category } => (*file_idx, category.clone()),
+            SettingsEntry::PermissionItem {
+                file_idx, category, ..
+            } => (*file_idx, category.clone()),
+            _ => {
+                self.status_message = Some("Add works on permission sections.".to_string());
+                return;
+            }
+        };
+
+        self.settings_state.add_target = Some((file_idx, category.clone()));
+        self.text_input.clear();
+        self.mode = Mode::TitleInput;
+        self.status_message = Some(format!("Add to {category}:"));
+    }
+
+    /// Commits the add-permission input.
+    pub(crate) fn commit_add_permission(&mut self) {
+        let title = self.text_input.text().trim().to_string();
+        if title.is_empty() {
+            self.status_message = Some("Entry cannot be empty.".to_string());
+            return;
+        }
+
+        let target = match self.settings_state.add_target.take() {
+            Some(t) => t,
+            None => {
+                self.reset_to_normal();
+                return;
+            }
+        };
+
+        let (file_idx, category) = target;
+        let val = title.clone();
+        if self.mutate_settings_json(file_idx, |obj| {
+            let perms = obj
+                .entry("permissions")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(perms_obj) = perms.as_object_mut() {
+                let arr = perms_obj
+                    .entry(&category)
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                if let Some(arr) = arr.as_array_mut() {
+                    let new_val = serde_json::Value::String(val.clone());
+                    if !arr.contains(&new_val) {
+                        arr.push(new_val);
+                    }
+                }
+            }
+        }) {
+            self.status_message = Some(format!("Added '{title}' to {category}."));
+        }
+        self.reset_to_normal();
+    }
+
+    /// Applies a mutation to the JSON object in a settings file, writes it back,
+    /// and rebuilds the display. Returns true on success.
+    fn mutate_settings_json(
+        &mut self,
+        file_idx: usize,
+        mutate: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+    ) -> bool {
+        let collection = match &mut self.settings_collection {
+            Some(c) => c,
+            None => return false,
+        };
+        let file = match collection.files.get_mut(file_idx) {
+            Some(f) => f,
+            None => return false,
+        };
+
+        let obj = match file.value.as_object_mut() {
+            Some(o) => o,
+            None => {
+                self.status_message = Some("Cannot modify non-object settings.".to_string());
+                return false;
+            }
+        };
+
+        mutate(obj);
+
+        let path = file.path.clone();
+        let value = file.value.clone();
+        if let Err(err) = write_settings_file(&path, &value) {
+            self.status_message = Some(format!("Write failed: {err}"));
+            return false;
+        }
+
+        let saved_cursor = self.settings_state.cursor;
+        self.rebuild_settings_display();
+        // Restore cursor position, clamped to new line count
+        let max = self.settings_state.lines.len().saturating_sub(1);
+        self.settings_state.cursor = saved_cursor.min(max);
+        self.settings_state.scroll = 0;
+        self.settings_state.ensure_cursor_visible();
+        true
+    }
+
     pub(crate) fn switch_to_settings(&mut self) {
         let project = std::env::current_dir().unwrap_or_default();
         self.switch_to_settings_from(&project);
@@ -150,21 +351,26 @@ impl App {
         let Some(collection) = &self.settings_collection else {
             return;
         };
-        let (lines, line_map) = if self.settings_state.merged_view {
+        let display_collection;
+        let coll_ref = if self.settings_state.merged_view {
             let merged = crate::settings::merge_settings(collection);
-            let synthetic = SettingsCollection {
+            display_collection = SettingsCollection {
                 files: vec![SettingsFile {
                     label: "Effective".to_string(),
                     path: PathBuf::new(),
                     value: merged,
                 }],
             };
-            format_settings_with_map(&synthetic)
+            &display_collection
         } else {
-            format_settings_with_map(collection)
+            display_collection = collection.clone();
+            &display_collection
         };
+        let (lines, line_map) = format_settings_with_map(coll_ref);
+        let entry_map = build_entry_map(&lines, &line_map, coll_ref);
         self.settings_state.lines = lines;
         self.settings_state.line_map = line_map;
+        self.settings_state.entry_map = entry_map;
         self.settings_state.scroll = 0;
         self.settings_state.cursor = 0;
         self.settings_state.collapsed.clear();
@@ -187,6 +393,22 @@ impl App {
         let project = std::env::current_dir().unwrap_or_default();
         let collection = crate::settings::discover_settings_files(&project);
         self.apply_settings_collection(collection);
+    }
+
+    /// Handles key events when in TitleInput mode on Settings screen (add permission).
+    pub(crate) fn handle_settings_add_input_key(&mut self, key_event: KeyEvent) {
+        match key_event.code {
+            KeyCode::Esc => {
+                self.settings_state.add_target = None;
+                self.reset_to_normal();
+            }
+            KeyCode::Enter => {
+                self.commit_add_permission();
+            }
+            _ => {
+                self.text_input.handle_edit_key(key_event.code);
+            }
+        }
     }
 
     fn enter_settings_edit_mode(&mut self) {
@@ -568,6 +790,336 @@ mod tests {
         assert!(
             !help_text.contains("Edit"),
             "Help bar should NOT show Edit in merged view: {help_text}"
+        );
+    }
+
+    // --- Interactive editing tests ---
+
+    fn settings_app_with_file(json: &str) -> (App, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let settings_dir = tmp.path().join(".claude");
+        fs::create_dir_all(&settings_dir).unwrap();
+        let settings_file = settings_dir.join("settings.json");
+        fs::write(&settings_file, json).unwrap();
+
+        let collection = crate::settings::SettingsCollection {
+            files: vec![crate::settings::SettingsFile {
+                label: "Test".to_string(),
+                path: settings_file,
+                value: serde_json::from_str(json).unwrap(),
+            }],
+        };
+
+        let mut app = App::new(vec![], &Config::default());
+        app.switch_to_settings_with(&collection);
+        (app, tmp)
+    }
+
+    #[test]
+    fn space_toggles_boolean_field() {
+        let (mut app, tmp) = settings_app_with_file(r#"{"thinking":true}"#);
+
+        // Find the boolean line
+        let bool_idx = app
+            .settings_state
+            .entry_map
+            .iter()
+            .position(|e| {
+                matches!(e, crate::settings::SettingsEntry::BooleanField { key, .. } if key == "thinking")
+            })
+            .unwrap();
+        app.settings_state.cursor = bool_idx;
+
+        app.handle_key_event(key_event(KeyCode::Char(' ')));
+
+        // Verify the file was written with false
+        let settings_file = tmp.path().join(".claude/settings.json");
+        let content = fs::read_to_string(&settings_file).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(
+            !parsed.get("thinking").unwrap().as_bool().unwrap(),
+            "Should toggle from true to false"
+        );
+
+        // Status message should confirm
+        assert!(
+            app.status_message.as_deref().unwrap().contains("false"),
+            "Should confirm toggle, got: {:?}",
+            app.status_message
+        );
+    }
+
+    #[test]
+    fn space_toggles_boolean_back() {
+        let (mut app, tmp) = settings_app_with_file(r#"{"thinking":false}"#);
+
+        let bool_idx = app
+            .settings_state
+            .entry_map
+            .iter()
+            .position(|e| matches!(e, crate::settings::SettingsEntry::BooleanField { .. }))
+            .unwrap();
+        app.settings_state.cursor = bool_idx;
+
+        app.handle_key_event(key_event(KeyCode::Char(' ')));
+
+        let settings_file = tmp.path().join(".claude/settings.json");
+        let content = fs::read_to_string(&settings_file).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(
+            parsed.get("thinking").unwrap().as_bool().unwrap(),
+            "Should toggle from false to true"
+        );
+    }
+
+    #[test]
+    fn space_on_non_boolean_shows_message() {
+        let (mut app, _tmp) = settings_app_with_file(r#"{"model":"opus"}"#);
+        app.settings_state.cursor = 0; // Section header
+
+        app.handle_key_event(key_event(KeyCode::Char(' ')));
+
+        assert!(app.status_message.as_deref().unwrap().contains("boolean"),);
+    }
+
+    #[test]
+    fn d_removes_permission_item() {
+        let (mut app, tmp) =
+            settings_app_with_file(r#"{"permissions":{"allow":["Read","Write","Bash"]}}"#);
+
+        // Find the "Write" permission item
+        let write_idx = app
+            .settings_state
+            .entry_map
+            .iter()
+            .position(|e| {
+                matches!(e, crate::settings::SettingsEntry::PermissionItem { value, .. } if value == "Write")
+            })
+            .unwrap();
+        app.settings_state.cursor = write_idx;
+
+        app.handle_key_event(key_event(KeyCode::Char('d')));
+
+        let settings_file = tmp.path().join(".claude/settings.json");
+        let content = fs::read_to_string(&settings_file).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let allow = parsed
+            .get("permissions")
+            .unwrap()
+            .get("allow")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        let items: Vec<&str> = allow.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(items, vec!["Read", "Bash"], "Write should be removed");
+    }
+
+    #[test]
+    fn d_removes_mcp_server() {
+        let (mut app, tmp) = settings_app_with_file(
+            r#"{"mcpServers":{"rust-cargo":{"command":"npx"},"ctx7":{"command":"node"}}}"#,
+        );
+
+        // Find the rust-cargo server entry
+        let server_idx = app
+            .settings_state
+            .entry_map
+            .iter()
+            .position(|e| {
+                matches!(e, crate::settings::SettingsEntry::McpServer { name, .. } if name == "rust-cargo")
+            })
+            .unwrap();
+        app.settings_state.cursor = server_idx;
+
+        app.handle_key_event(key_event(KeyCode::Char('d')));
+
+        let settings_file = tmp.path().join(".claude/settings.json");
+        let content = fs::read_to_string(&settings_file).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let servers = parsed.get("mcpServers").unwrap().as_object().unwrap();
+        assert!(
+            !servers.contains_key("rust-cargo"),
+            "rust-cargo should be removed"
+        );
+        assert!(servers.contains_key("ctx7"), "ctx7 should remain");
+    }
+
+    #[test]
+    fn a_on_permission_enters_add_mode() {
+        let (mut app, _tmp) = settings_app_with_file(r#"{"permissions":{"allow":["Read"]}}"#);
+
+        let perm_idx = app
+            .settings_state
+            .entry_map
+            .iter()
+            .position(|e| {
+                matches!(e, crate::settings::SettingsEntry::PermissionHeader { category, .. } if category == "allow")
+            })
+            .unwrap();
+        app.settings_state.cursor = perm_idx;
+
+        app.handle_key_event(key_event(KeyCode::Char('a')));
+
+        assert_eq!(app.mode, Mode::TitleInput);
+        assert!(app.settings_state.add_target.is_some());
+    }
+
+    #[test]
+    fn add_permission_commits_new_entry() {
+        let (mut app, tmp) = settings_app_with_file(r#"{"permissions":{"allow":["Read"]}}"#);
+
+        let perm_idx = app
+            .settings_state
+            .entry_map
+            .iter()
+            .position(|e| matches!(e, crate::settings::SettingsEntry::PermissionHeader { .. }))
+            .unwrap();
+        app.settings_state.cursor = perm_idx;
+
+        // Enter add mode
+        app.handle_key_event(key_event(KeyCode::Char('a')));
+        assert_eq!(app.mode, Mode::TitleInput);
+
+        // Type "Write"
+        for c in "Write".chars() {
+            app.handle_key_event(key_event(KeyCode::Char(c)));
+        }
+        app.handle_key_event(key_event(KeyCode::Enter));
+
+        assert_eq!(app.mode, Mode::Normal);
+
+        let settings_file = tmp.path().join(".claude/settings.json");
+        let content = fs::read_to_string(&settings_file).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let allow = parsed
+            .get("permissions")
+            .unwrap()
+            .get("allow")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        let items: Vec<&str> = allow.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(items, vec!["Read", "Write"]);
+    }
+
+    #[test]
+    fn add_permission_esc_cancels() {
+        let (mut app, _tmp) = settings_app_with_file(r#"{"permissions":{"allow":["Read"]}}"#);
+
+        let perm_idx = app
+            .settings_state
+            .entry_map
+            .iter()
+            .position(|e| matches!(e, crate::settings::SettingsEntry::PermissionHeader { .. }))
+            .unwrap();
+        app.settings_state.cursor = perm_idx;
+
+        app.handle_key_event(key_event(KeyCode::Char('a')));
+        assert_eq!(app.mode, Mode::TitleInput);
+
+        app.handle_key_event(key_event(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.settings_state.add_target.is_none());
+    }
+
+    #[test]
+    fn add_duplicate_permission_is_noop() {
+        let (mut app, tmp) = settings_app_with_file(r#"{"permissions":{"allow":["Read"]}}"#);
+
+        let perm_idx = app
+            .settings_state
+            .entry_map
+            .iter()
+            .position(|e| matches!(e, crate::settings::SettingsEntry::PermissionHeader { .. }))
+            .unwrap();
+        app.settings_state.cursor = perm_idx;
+
+        app.handle_key_event(key_event(KeyCode::Char('a')));
+        for c in "Read".chars() {
+            app.handle_key_event(key_event(KeyCode::Char(c)));
+        }
+        app.handle_key_event(key_event(KeyCode::Enter));
+
+        let settings_file = tmp.path().join(".claude/settings.json");
+        let content = fs::read_to_string(&settings_file).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let allow = parsed
+            .get("permissions")
+            .unwrap()
+            .get("allow")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(allow.len(), 1, "Should not add duplicate");
+    }
+
+    #[test]
+    fn space_disabled_in_merged_view() {
+        let (mut app, _tmp) = settings_app_with_file(r#"{"thinking":true}"#);
+        app.settings_state.merged_view = true;
+
+        app.handle_key_event(key_event(KeyCode::Char(' ')));
+
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("merged view"),
+        );
+    }
+
+    #[test]
+    fn d_disabled_in_merged_view() {
+        let (mut app, _tmp) = settings_app_with_file(r#"{"permissions":{"allow":["Read"]}}"#);
+        app.settings_state.merged_view = true;
+
+        app.handle_key_event(key_event(KeyCode::Char('d')));
+
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("merged view"),
+        );
+    }
+
+    #[test]
+    fn help_bar_shows_toggle_on_boolean() {
+        let (mut app, _tmp) = settings_app_with_file(r#"{"thinking":true}"#);
+
+        let bool_idx = app
+            .settings_state
+            .entry_map
+            .iter()
+            .position(|e| matches!(e, crate::settings::SettingsEntry::BooleanField { .. }))
+            .unwrap();
+        app.settings_state.cursor = bool_idx;
+
+        let help = app.help_line();
+        let help_text: String = help.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(
+            help_text.contains("Toggle"),
+            "Help bar should show Toggle on boolean, got: {help_text}"
+        );
+    }
+
+    #[test]
+    fn help_bar_shows_add_remove_on_permission_item() {
+        let (mut app, _tmp) = settings_app_with_file(r#"{"permissions":{"allow":["Read"]}}"#);
+
+        let item_idx = app
+            .settings_state
+            .entry_map
+            .iter()
+            .position(|e| matches!(e, crate::settings::SettingsEntry::PermissionItem { .. }))
+            .unwrap();
+        app.settings_state.cursor = item_idx;
+
+        let help = app.help_line();
+        let help_text: String = help.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(
+            help_text.contains("Add") && help_text.contains("Remove"),
+            "Help bar should show Add and Remove on permission item, got: {help_text}"
         );
     }
 
