@@ -29,6 +29,9 @@ use crate::model::SourceRoot;
 use crate::settings::SettingsCollection;
 use crate::settings::SettingsEntry;
 use crate::settings::SettingsLineMap;
+use crate::settings::SettingsMemory;
+use crate::settings::next_enum_value;
+use crate::settings::toggle_binary_value;
 use crate::tui::theme::Theme;
 
 pub type TreeId = String;
@@ -164,6 +167,8 @@ pub struct SettingsState {
     pub collapsed: HashSet<usize>,
     /// Target for add-permission input: (file_idx, category).
     pub add_target: Option<(usize, String)>,
+    /// Memory of recently removed settings entries.
+    pub memory: SettingsMemory,
 }
 
 impl SettingsState {
@@ -503,8 +508,18 @@ impl App {
                     .get(self.settings_state.cursor)
                 {
                     match entry {
-                        SettingsEntry::BooleanField { .. } => {
+                        SettingsEntry::BooleanField { .. } | SettingsEntry::EnvVar { .. } => {
                             pairs.push(("Space", "Toggle"));
+                            if matches!(entry, SettingsEntry::EnvVar { .. }) {
+                                pairs.push(("d", "Remove"));
+                            }
+                        }
+                        SettingsEntry::ScalarField { key, value, .. } => {
+                            if next_enum_value(key, value).is_some()
+                                || toggle_binary_value(value).is_some()
+                            {
+                                pairs.push(("Space", "Toggle"));
+                            }
                         }
                         SettingsEntry::PermissionItem { .. } => {
                             pairs.push(("a", "Add"));
@@ -518,6 +533,9 @@ impl App {
                         }
                         _ => {}
                     }
+                }
+                if !self.settings_state.memory.items.is_empty() {
+                    pairs.push(("r", "Restore"));
                 }
                 pairs.extend_from_slice(&[
                     ("↑/↓", "Scroll"),

@@ -17,11 +17,15 @@ use ratatui::widgets::ScrollbarState;
 use super::app::App;
 use super::app::Mode;
 use super::app::Screen;
+use crate::settings::MemoryItem;
+use crate::settings::MemoryKind;
 use crate::settings::SettingsCollection;
 use crate::settings::SettingsEntry;
 use crate::settings::SettingsFile;
 use crate::settings::build_entry_map;
 use crate::settings::format_settings_with_map;
+use crate::settings::next_enum_value;
+use crate::settings::toggle_binary_value;
 use crate::settings::write_settings_file;
 
 impl App {
@@ -104,6 +108,9 @@ impl App {
                 self.status_message =
                     Some("Add not available in merged view — press m to switch.".to_string());
             }
+            KeyCode::Char('r') if !self.settings_state.merged_view => {
+                self.restore_from_memory();
+            }
             KeyCode::Char('q') => self.exit = true,
             KeyCode::Down | KeyCode::Char('j') => {
                 self.settings_state.cursor_down();
@@ -141,7 +148,7 @@ impl App {
         }
     }
 
-    /// Toggles a boolean field at the cursor.
+    /// Toggles/cycles a value at the cursor: booleans, enums, binary env vars.
     fn toggle_settings_value(&mut self) {
         let cursor = self.settings_state.cursor;
         let entry = match self.settings_state.entry_map.get(cursor) {
@@ -162,13 +169,66 @@ impl App {
                     self.status_message = Some(format!("{key} set to {new_value}."));
                 }
             }
+            SettingsEntry::ScalarField {
+                file_idx,
+                ref key,
+                ref value,
+            } => {
+                // Try known enum cycle first
+                if let Some(next) = next_enum_value(key, value) {
+                    let k = key.clone();
+                    let next_val = next.to_string();
+                    if self.mutate_settings_json(file_idx, |obj| {
+                        obj.insert(k, serde_json::Value::String(next_val.clone()));
+                    }) {
+                        self.status_message = Some(format!("{key} set to {next_val}."));
+                    }
+                } else if let Some(toggled) = toggle_binary_value(value) {
+                    // Try binary string toggle (true/false, 0/1 as strings)
+                    let k = key.clone();
+                    let toggled_val = toggled.to_string();
+                    if self.mutate_settings_json(file_idx, |obj| {
+                        obj.insert(k, serde_json::Value::String(toggled_val.clone()));
+                    }) {
+                        self.status_message = Some(format!("{key} set to {toggled_val}."));
+                    }
+                } else {
+                    self.status_message = Some(format!("{key} is not a toggleable field."));
+                }
+            }
+            SettingsEntry::EnvVar {
+                file_idx,
+                ref name,
+                ref value,
+            } => {
+                if let Some(toggled) = toggle_binary_value(value) {
+                    let env_name = name.clone();
+                    let toggled_val = toggled.to_string();
+                    if self.mutate_settings_json(file_idx, |obj| {
+                        let env = obj
+                            .entry("env")
+                            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                        if let Some(env_obj) = env.as_object_mut() {
+                            env_obj.insert(
+                                env_name.clone(),
+                                serde_json::Value::String(toggled_val.clone()),
+                            );
+                        }
+                    }) {
+                        self.status_message = Some(format!("{name} set to {toggled}."));
+                    }
+                } else {
+                    self.status_message = Some(format!("{name} is not a binary value (0/1)."));
+                }
+            }
             _ => {
-                self.status_message = Some("Space toggles boolean fields only.".to_string());
+                self.status_message = Some("Not a toggleable field.".to_string());
             }
         }
     }
 
-    /// Deletes a permission item or MCP server at the cursor.
+    /// Deletes a permission item, MCP server, or env var at the cursor.
+    /// Removed items are saved to memory for easy restoration.
     fn delete_settings_entry(&mut self) {
         let cursor = self.settings_state.cursor;
         let entry = match self.settings_state.entry_map.get(cursor) {
@@ -193,11 +253,30 @@ impl App {
                         arr.retain(|item| item.as_str() != Some(&val));
                     }
                 }) {
-                    self.status_message = Some(format!("Removed '{val}' from {cat}."));
+                    self.settings_state.memory.remember(MemoryItem {
+                        kind: MemoryKind::Permission {
+                            category: cat.clone(),
+                        },
+                        value: serde_json::Value::String(val.clone()),
+                        label: val.clone(),
+                    });
+                    self.save_settings_memory();
+                    self.status_message =
+                        Some(format!("Removed '{val}' from {cat}. Press r to restore."));
                 }
             }
             SettingsEntry::McpServer { file_idx, ref name } => {
                 let server_name = name.clone();
+                // Capture the full server config before removing
+                let server_config = self
+                    .settings_collection
+                    .as_ref()
+                    .and_then(|c| c.files.get(file_idx))
+                    .and_then(|f| f.value.get("mcpServers"))
+                    .and_then(|s| s.get(&server_name))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+
                 if self.mutate_settings_json(file_idx, |obj| {
                     if let Some(servers) = obj.get_mut("mcpServers")
                         && let Some(servers_obj) = servers.as_object_mut()
@@ -205,12 +284,49 @@ impl App {
                         servers_obj.remove(&server_name);
                     }
                 }) {
-                    self.status_message = Some(format!("Removed MCP server '{server_name}'."));
+                    self.settings_state.memory.remember(MemoryItem {
+                        kind: MemoryKind::McpServer,
+                        value: serde_json::json!({
+                            "name": server_name,
+                            "config": server_config,
+                        }),
+                        label: server_name.clone(),
+                    });
+                    self.save_settings_memory();
+                    self.status_message = Some(format!(
+                        "Removed MCP server '{server_name}'. Press r to restore."
+                    ));
+                }
+            }
+            SettingsEntry::EnvVar {
+                file_idx,
+                ref name,
+                ref value,
+            } => {
+                let env_name = name.clone();
+                let env_value = value.clone();
+                if self.mutate_settings_json(file_idx, |obj| {
+                    if let Some(env) = obj.get_mut("env")
+                        && let Some(env_obj) = env.as_object_mut()
+                    {
+                        env_obj.remove(&env_name);
+                    }
+                }) {
+                    self.settings_state.memory.remember(MemoryItem {
+                        kind: MemoryKind::EnvVar,
+                        value: serde_json::json!({
+                            "name": env_name,
+                            "value": env_value,
+                        }),
+                        label: format!("{env_name}={env_value}"),
+                    });
+                    self.save_settings_memory();
+                    self.status_message = Some(format!("Removed {env_name}. Press r to restore."));
                 }
             }
             _ => {
                 self.status_message =
-                    Some("Delete works on permission items and MCP servers.".to_string());
+                    Some("Delete works on permissions, MCP servers, and env vars.".to_string());
             }
         }
     }
@@ -279,6 +395,105 @@ impl App {
         self.reset_to_normal();
     }
 
+    /// Restores the most recent memory item, applying it to the first settings file.
+    fn restore_from_memory(&mut self) {
+        if self.settings_state.memory.items.is_empty() {
+            self.status_message = Some("Memory is empty — nothing to restore.".to_string());
+            return;
+        }
+
+        let item = self.settings_state.memory.items[0].clone();
+
+        // Determine which file to restore to (use first/global file)
+        let file_idx = 0;
+
+        let success = match &item.kind {
+            MemoryKind::Permission { category } => {
+                let cat = category.clone();
+                let val = item.value.clone();
+                self.mutate_settings_json(file_idx, |obj| {
+                    let perms = obj
+                        .entry("permissions")
+                        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                    if let Some(perms_obj) = perms.as_object_mut() {
+                        let arr = perms_obj
+                            .entry(&cat)
+                            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+                        if let Some(arr) = arr.as_array_mut()
+                            && !arr.contains(&val)
+                        {
+                            arr.push(val);
+                        }
+                    }
+                })
+            }
+            MemoryKind::McpServer => {
+                let name = item
+                    .value
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let config = item
+                    .value
+                    .get("config")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                self.mutate_settings_json(file_idx, |obj| {
+                    let servers = obj
+                        .entry("mcpServers")
+                        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                    if let Some(servers_obj) = servers.as_object_mut() {
+                        servers_obj.insert(name.clone(), config);
+                    }
+                })
+            }
+            MemoryKind::EnvVar => {
+                let name = item
+                    .value
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let val = item
+                    .value
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                self.mutate_settings_json(file_idx, |obj| {
+                    let env = obj
+                        .entry("env")
+                        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                    if let Some(env_obj) = env.as_object_mut() {
+                        env_obj.insert(name.clone(), serde_json::Value::String(val));
+                    }
+                })
+            }
+        };
+
+        if success {
+            let label = item.label.clone();
+            self.settings_state.memory.forget(0);
+            self.save_settings_memory();
+            self.status_message = Some(format!("Restored '{label}'."));
+        }
+    }
+
+    /// Saves the settings memory to disk.
+    fn save_settings_memory(&self) {
+        if let Some(path) = crate::settings::memory_path() {
+            let _ = crate::settings::save_memory(&self.settings_state.memory, &path);
+        }
+    }
+
+    /// Loads settings memory on entering the settings screen.
+    pub(crate) fn load_settings_memory(&mut self) {
+        if let Some(path) = crate::settings::memory_path() {
+            self.settings_state.memory = crate::settings::load_memory(&path);
+        }
+    }
+
     /// Applies a mutation to the JSON object in a settings file, writes it back,
     /// and rebuilds the display. Returns true on success.
     fn mutate_settings_json(
@@ -330,6 +545,7 @@ impl App {
     pub fn switch_to_settings_from(&mut self, project: &Path) {
         let collection = crate::settings::discover_settings_files(project);
         self.apply_settings_collection(collection);
+        self.load_settings_memory();
         self.screen = Screen::Settings;
     }
 
@@ -873,13 +1089,20 @@ mod tests {
     }
 
     #[test]
-    fn space_on_non_boolean_shows_message() {
+    fn space_on_non_toggleable_shows_message() {
         let (mut app, _tmp) = settings_app_with_file(r#"{"model":"opus"}"#);
         app.settings_state.cursor = 0; // Section header
 
         app.handle_key_event(key_event(KeyCode::Char(' ')));
 
-        assert!(app.status_message.as_deref().unwrap().contains("boolean"),);
+        assert!(
+            app.status_message
+                .as_deref()
+                .unwrap()
+                .contains("toggleable"),
+            "Should show not-toggleable message, got: {:?}",
+            app.status_message
+        );
     }
 
     #[test]
@@ -1120,6 +1343,224 @@ mod tests {
         assert!(
             help_text.contains("Add") && help_text.contains("Remove"),
             "Help bar should show Add and Remove on permission item, got: {help_text}"
+        );
+    }
+
+    // --- Smart toggle tests ---
+
+    #[test]
+    fn space_cycles_enum_field() {
+        let (mut app, tmp) = settings_app_with_file(r#"{"effortLevel":"high"}"#);
+
+        let scalar_idx = app
+            .settings_state
+            .entry_map
+            .iter()
+            .position(|e| {
+                matches!(e, crate::settings::SettingsEntry::ScalarField { key, .. } if key == "effortLevel")
+            })
+            .unwrap();
+        app.settings_state.cursor = scalar_idx;
+
+        app.handle_key_event(key_event(KeyCode::Char(' ')));
+
+        let settings_file = tmp.path().join(".claude/settings.json");
+        let content = fs::read_to_string(&settings_file).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            parsed.get("effortLevel").unwrap().as_str().unwrap(),
+            "medium",
+            "Should cycle from high to medium"
+        );
+    }
+
+    #[test]
+    fn space_toggles_binary_env_var() {
+        let (mut app, tmp) =
+            settings_app_with_file(r#"{"env":{"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":"1"}}"#);
+
+        let env_idx = app
+            .settings_state
+            .entry_map
+            .iter()
+            .position(|e| matches!(e, crate::settings::SettingsEntry::EnvVar { .. }))
+            .unwrap();
+        app.settings_state.cursor = env_idx;
+
+        app.handle_key_event(key_event(KeyCode::Char(' ')));
+
+        let settings_file = tmp.path().join(".claude/settings.json");
+        let content = fs::read_to_string(&settings_file).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            parsed
+                .get("env")
+                .unwrap()
+                .get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "0",
+            "Should toggle from 1 to 0"
+        );
+    }
+
+    #[test]
+    fn space_on_non_binary_env_var_shows_message() {
+        let (mut app, _tmp) = settings_app_with_file(r#"{"env":{"RUST_LOG":"debug"}}"#);
+
+        let env_idx = app
+            .settings_state
+            .entry_map
+            .iter()
+            .position(|e| matches!(e, crate::settings::SettingsEntry::EnvVar { .. }))
+            .unwrap();
+        app.settings_state.cursor = env_idx;
+
+        app.handle_key_event(key_event(KeyCode::Char(' ')));
+
+        assert!(
+            app.status_message.as_deref().unwrap().contains("binary"),
+            "Should show binary message, got: {:?}",
+            app.status_message
+        );
+    }
+
+    // --- Memory tests ---
+
+    #[test]
+    fn d_on_permission_saves_to_memory() {
+        let (mut app, _tmp) =
+            settings_app_with_file(r#"{"permissions":{"allow":["Read","Write"]}}"#);
+
+        let item_idx = app
+            .settings_state
+            .entry_map
+            .iter()
+            .position(|e| {
+                matches!(e, crate::settings::SettingsEntry::PermissionItem { value, .. } if value == "Read")
+            })
+            .unwrap();
+        app.settings_state.cursor = item_idx;
+
+        app.handle_key_event(key_event(KeyCode::Char('d')));
+
+        assert_eq!(app.settings_state.memory.items.len(), 1);
+        assert_eq!(app.settings_state.memory.items[0].label, "Read");
+    }
+
+    #[test]
+    fn r_restores_from_memory() {
+        let (mut app, tmp) =
+            settings_app_with_file(r#"{"permissions":{"allow":["Read","Write"]}}"#);
+
+        // Remove Read
+        let item_idx = app
+            .settings_state
+            .entry_map
+            .iter()
+            .position(|e| {
+                matches!(e, crate::settings::SettingsEntry::PermissionItem { value, .. } if value == "Read")
+            })
+            .unwrap();
+        app.settings_state.cursor = item_idx;
+        app.handle_key_event(key_event(KeyCode::Char('d')));
+
+        // Verify it was removed
+        let settings_file = tmp.path().join(".claude/settings.json");
+        let content = fs::read_to_string(&settings_file).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let allow = parsed
+            .get("permissions")
+            .unwrap()
+            .get("allow")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(!allow.iter().any(|v| v.as_str() == Some("Read")));
+
+        // Now restore
+        app.handle_key_event(key_event(KeyCode::Char('r')));
+
+        // Verify it was restored
+        let content = fs::read_to_string(&settings_file).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let allow = parsed
+            .get("permissions")
+            .unwrap()
+            .get("allow")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(
+            allow.iter().any(|v| v.as_str() == Some("Read")),
+            "Read should be restored"
+        );
+
+        // Memory should be cleared
+        assert!(app.settings_state.memory.items.is_empty());
+    }
+
+    #[test]
+    fn r_on_empty_memory_shows_message() {
+        let (mut app, _tmp) = settings_app_with_file(r#"{"model":"opus"}"#);
+
+        app.handle_key_event(key_event(KeyCode::Char('r')));
+
+        assert!(
+            app.status_message.as_deref().unwrap().contains("empty"),
+            "Should show empty memory message, got: {:?}",
+            app.status_message
+        );
+    }
+
+    #[test]
+    fn d_on_env_var_saves_to_memory_and_removes() {
+        let (mut app, tmp) = settings_app_with_file(
+            r#"{"env":{"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":"1","FOO":"bar"}}"#,
+        );
+
+        let env_idx = app
+            .settings_state
+            .entry_map
+            .iter()
+            .position(|e| {
+                matches!(e, crate::settings::SettingsEntry::EnvVar { name, .. } if name == "FOO")
+            })
+            .unwrap();
+        app.settings_state.cursor = env_idx;
+
+        app.handle_key_event(key_event(KeyCode::Char('d')));
+
+        // Verify removed from file
+        let settings_file = tmp.path().join(".claude/settings.json");
+        let content = fs::read_to_string(&settings_file).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed.get("env").unwrap().get("FOO").is_none());
+
+        // Verify in memory
+        assert_eq!(app.settings_state.memory.items.len(), 1);
+        assert_eq!(app.settings_state.memory.items[0].label, "FOO=bar");
+    }
+
+    #[test]
+    fn help_bar_shows_restore_when_memory_has_items() {
+        let (mut app, _tmp) = settings_app_with_file(r#"{"model":"opus"}"#);
+        app.settings_state
+            .memory
+            .remember(crate::settings::MemoryItem {
+                kind: crate::settings::MemoryKind::Permission {
+                    category: "allow".to_string(),
+                },
+                value: serde_json::Value::String("Read".to_string()),
+                label: "Read".to_string(),
+            });
+
+        let help = app.help_line();
+        let help_text: String = help.spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(
+            help_text.contains("Restore"),
+            "Help bar should show Restore when memory has items, got: {help_text}"
         );
     }
 

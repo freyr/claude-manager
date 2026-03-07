@@ -1,3 +1,6 @@
+use serde::Deserialize;
+use serde::Serialize;
+use std::env;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -285,6 +288,12 @@ pub enum SettingsEntry {
     McpServerHeader { file_idx: usize },
     /// A single MCP server entry.
     McpServer { file_idx: usize, name: String },
+    /// An environment variable entry (e.g. "KEY=value").
+    EnvVar {
+        file_idx: usize,
+        name: String,
+        value: String,
+    },
     /// A generic sub-section header (hooks, plugins, env).
     SubHeader { file_idx: usize, key: String },
     /// A generic leaf line (hook entry, plugin name, env var, etc.).
@@ -387,8 +396,19 @@ pub fn build_entry_map(lines: &[String], line_map: &SettingsLineMap) -> Vec<Sett
         }
 
         // Inside generic sub-section
-        if in_sub_section.is_some() {
+        if let Some(ref section_key) = in_sub_section {
             if !trimmed.is_empty() {
+                // Env section: parse "KEY=value" lines
+                if section_key == "Env"
+                    && let Some((name, value)) = parse_env_line(trimmed)
+                {
+                    entries.push(SettingsEntry::EnvVar {
+                        file_idx,
+                        name,
+                        value,
+                    });
+                    continue;
+                }
                 entries.push(SettingsEntry::Leaf { file_idx });
                 continue;
             }
@@ -440,6 +460,17 @@ fn extract_mcp_server_name(trimmed: &str) -> Option<String> {
     Some(trimmed[..colon].to_string())
 }
 
+/// Parses an env var display line like "KEY=value" into (name, value).
+fn parse_env_line(trimmed: &str) -> Option<(String, String)> {
+    let eq = trimmed.find('=')?;
+    if eq == 0 {
+        return None;
+    }
+    let name = trimmed[..eq].to_string();
+    let value = trimmed[eq + 1..].to_string();
+    Some((name, value))
+}
+
 /// Parses a scalar display line like "Model: opus" into (key, value).
 fn parse_scalar_line(trimmed: &str) -> Option<(String, String)> {
     // Map display labels back to JSON keys
@@ -466,6 +497,44 @@ fn parse_scalar_line(trimmed: &str) -> Option<(String, String)> {
     }
 
     None
+}
+
+/// Known enum fields and their allowed values, in cycle order.
+///
+/// Space on a `ScalarField` whose key is in this list will cycle to the next value.
+pub const KNOWN_ENUMS: &[(&str, &[&str])] = &[
+    ("effortLevel", &["high", "medium", "low"]),
+    ("defaultMode", &["plan", "auto"]),
+];
+
+/// Returns the next value in a known enum cycle, or `None` if the key is not a known enum.
+pub fn next_enum_value(key: &str, current: &str) -> Option<&'static str> {
+    for &(enum_key, values) in KNOWN_ENUMS {
+        if enum_key == key {
+            let pos = values.iter().position(|&v| v == current);
+            return match pos {
+                Some(i) => Some(values[(i + 1) % values.len()]),
+                None => Some(values[0]),
+            };
+        }
+    }
+    None
+}
+
+/// Returns true if a string value looks like a binary toggle (0/1, true/false as strings).
+pub fn is_binary_value(value: &str) -> bool {
+    matches!(value, "0" | "1" | "true" | "false")
+}
+
+/// Returns the toggled binary value.
+pub fn toggle_binary_value(value: &str) -> Option<&'static str> {
+    match value {
+        "0" => Some("1"),
+        "1" => Some("0"),
+        "true" => Some("false"),
+        "false" => Some("true"),
+        _ => None,
+    }
 }
 
 /// Writes a settings JSON value back to a file atomically.
@@ -661,6 +730,97 @@ fn format_env(val: &serde_json::Value, lines: &mut Vec<String>) {
     for (key, val) in obj {
         lines.push(format!("    {key}={}", display_scalar(val)));
     }
+}
+
+/// A remembered removed item, stored for easy restoration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryItem {
+    /// What kind of item was removed.
+    pub kind: MemoryKind,
+    /// The raw JSON value that was removed (for full restoration).
+    pub value: serde_json::Value,
+    /// Human-readable label for display.
+    pub label: String,
+}
+
+/// The kind of remembered item.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MemoryKind {
+    /// A permission entry (e.g. "Read" from "allow").
+    Permission { category: String },
+    /// An MCP server with its full config.
+    McpServer,
+    /// An environment variable.
+    EnvVar,
+}
+
+/// Persisted memory of recently removed settings entries.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SettingsMemory {
+    #[serde(default)]
+    pub items: Vec<MemoryItem>,
+}
+
+impl SettingsMemory {
+    /// Maximum number of remembered items.
+    const MAX_ITEMS: usize = 50;
+
+    /// Adds an item to memory, deduplicating by label and kind.
+    pub fn remember(&mut self, item: MemoryItem) {
+        // Remove existing item with same label and kind
+        self.items
+            .retain(|existing| existing.label != item.label || existing.kind != item.kind);
+        self.items.insert(0, item);
+        self.items.truncate(Self::MAX_ITEMS);
+    }
+
+    /// Removes an item from memory by index.
+    pub fn forget(&mut self, index: usize) {
+        if index < self.items.len() {
+            self.items.remove(index);
+        }
+    }
+
+    /// Returns items filtered by kind.
+    pub fn items_for_kind(&self, kind: &MemoryKind) -> Vec<(usize, &MemoryItem)> {
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| std::mem::discriminant(&item.kind) == std::mem::discriminant(kind))
+            .collect()
+    }
+}
+
+/// Returns the default memory file path.
+pub fn memory_path() -> Option<PathBuf> {
+    let home = env::var("HOME").ok()?;
+    Some(memory_path_in(&PathBuf::from(home)))
+}
+
+/// Returns the memory file path relative to a given home directory.
+pub fn memory_path_in(home: &Path) -> PathBuf {
+    home.join(".config").join("jigolo").join("memory.toml")
+}
+
+/// Loads the settings memory from the default path.
+pub fn load_memory(path: &Path) -> SettingsMemory {
+    match fs::read_to_string(path) {
+        Ok(contents) => toml::from_str(&contents).unwrap_or_default(),
+        Err(_) => SettingsMemory::default(),
+    }
+}
+
+/// Saves the settings memory to the given path.
+pub fn save_memory(memory: &SettingsMemory, path: &Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+    let contents = toml::to_string_pretty(memory).context("failed to serialize memory")?;
+    fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1112,6 +1272,226 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert!(parsed.get("old").is_none());
         assert_eq!(parsed.get("new").unwrap().as_str().unwrap(), "value");
+    }
+
+    // --- EnvVar entry map tests ---
+
+    #[test]
+    fn entry_map_identifies_env_vars() {
+        let collection = collection_from_json(r#"{"env":{"RUST_LOG":"debug","FOO":"bar"}}"#);
+        let (lines, line_map) = format_settings_with_map(&collection);
+        let entries = build_entry_map(&lines, &line_map);
+
+        let env_vars: Vec<_> = entries
+            .iter()
+            .filter_map(|e| match e {
+                SettingsEntry::EnvVar { name, value, .. } => Some((name.as_str(), value.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            env_vars.len(),
+            2,
+            "Should find 2 EnvVar entries, got entries: {:?}",
+            entries
+        );
+    }
+
+    #[test]
+    fn entry_map_env_var_has_correct_name_and_value() {
+        let collection =
+            collection_from_json(r#"{"env":{"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":"1"}}"#);
+        let (lines, line_map) = format_settings_with_map(&collection);
+        let entries = build_entry_map(&lines, &line_map);
+
+        let env = entries.iter().find_map(|e| match e {
+            SettingsEntry::EnvVar { name, value, .. } => Some((name.clone(), value.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            env,
+            Some((
+                "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS".to_string(),
+                "1".to_string()
+            ))
+        );
+    }
+
+    // --- Smart toggle tests ---
+
+    #[test]
+    fn next_enum_value_cycles_effort_level() {
+        assert_eq!(next_enum_value("effortLevel", "high"), Some("medium"));
+        assert_eq!(next_enum_value("effortLevel", "medium"), Some("low"));
+        assert_eq!(next_enum_value("effortLevel", "low"), Some("high"));
+    }
+
+    #[test]
+    fn next_enum_value_cycles_default_mode() {
+        assert_eq!(next_enum_value("defaultMode", "plan"), Some("auto"));
+        assert_eq!(next_enum_value("defaultMode", "auto"), Some("plan"));
+    }
+
+    #[test]
+    fn next_enum_value_unknown_key_returns_none() {
+        assert_eq!(next_enum_value("model", "opus"), None);
+    }
+
+    #[test]
+    fn next_enum_value_unknown_current_returns_first() {
+        assert_eq!(next_enum_value("effortLevel", "unknown"), Some("high"));
+    }
+
+    #[test]
+    fn toggle_binary_value_flips() {
+        assert_eq!(toggle_binary_value("1"), Some("0"));
+        assert_eq!(toggle_binary_value("0"), Some("1"));
+        assert_eq!(toggle_binary_value("true"), Some("false"));
+        assert_eq!(toggle_binary_value("false"), Some("true"));
+        assert_eq!(toggle_binary_value("opus"), None);
+    }
+
+    #[test]
+    fn is_binary_value_detects_binaries() {
+        assert!(is_binary_value("0"));
+        assert!(is_binary_value("1"));
+        assert!(is_binary_value("true"));
+        assert!(is_binary_value("false"));
+        assert!(!is_binary_value("high"));
+        assert!(!is_binary_value("opus"));
+    }
+
+    // --- Memory tests ---
+
+    #[test]
+    fn memory_remember_adds_item() {
+        let mut memory = SettingsMemory::default();
+        memory.remember(MemoryItem {
+            kind: MemoryKind::Permission {
+                category: "allow".to_string(),
+            },
+            value: serde_json::Value::String("Read".to_string()),
+            label: "Read".to_string(),
+        });
+        assert_eq!(memory.items.len(), 1);
+        assert_eq!(memory.items[0].label, "Read");
+    }
+
+    #[test]
+    fn memory_deduplicates_by_label_and_kind() {
+        let mut memory = SettingsMemory::default();
+        let item = MemoryItem {
+            kind: MemoryKind::Permission {
+                category: "allow".to_string(),
+            },
+            value: serde_json::Value::String("Read".to_string()),
+            label: "Read".to_string(),
+        };
+        memory.remember(item.clone());
+        memory.remember(item);
+        assert_eq!(memory.items.len(), 1);
+    }
+
+    #[test]
+    fn memory_most_recent_first() {
+        let mut memory = SettingsMemory::default();
+        memory.remember(MemoryItem {
+            kind: MemoryKind::Permission {
+                category: "allow".to_string(),
+            },
+            value: serde_json::Value::String("Read".to_string()),
+            label: "Read".to_string(),
+        });
+        memory.remember(MemoryItem {
+            kind: MemoryKind::Permission {
+                category: "allow".to_string(),
+            },
+            value: serde_json::Value::String("Write".to_string()),
+            label: "Write".to_string(),
+        });
+        assert_eq!(memory.items[0].label, "Write");
+        assert_eq!(memory.items[1].label, "Read");
+    }
+
+    #[test]
+    fn memory_forget_removes_by_index() {
+        let mut memory = SettingsMemory::default();
+        memory.remember(MemoryItem {
+            kind: MemoryKind::Permission {
+                category: "allow".to_string(),
+            },
+            value: serde_json::Value::String("Read".to_string()),
+            label: "Read".to_string(),
+        });
+        memory.forget(0);
+        assert!(memory.items.is_empty());
+    }
+
+    #[test]
+    fn memory_items_for_kind_filters() {
+        let mut memory = SettingsMemory::default();
+        memory.remember(MemoryItem {
+            kind: MemoryKind::Permission {
+                category: "allow".to_string(),
+            },
+            value: serde_json::Value::String("Read".to_string()),
+            label: "Read".to_string(),
+        });
+        memory.remember(MemoryItem {
+            kind: MemoryKind::McpServer,
+            value: serde_json::json!({"command": "npx"}),
+            label: "rust-cargo".to_string(),
+        });
+
+        let perms = memory.items_for_kind(&MemoryKind::Permission {
+            category: String::new(),
+        });
+        assert_eq!(perms.len(), 1);
+        assert_eq!(perms[0].1.label, "Read");
+    }
+
+    #[test]
+    fn memory_round_trip_save_load() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("memory.toml");
+
+        let mut memory = SettingsMemory::default();
+        memory.remember(MemoryItem {
+            kind: MemoryKind::Permission {
+                category: "allow".to_string(),
+            },
+            value: serde_json::Value::String("Bash".to_string()),
+            label: "Bash".to_string(),
+        });
+
+        save_memory(&memory, &path).unwrap();
+        let loaded = load_memory(&path);
+
+        assert_eq!(loaded, memory);
+    }
+
+    #[test]
+    fn memory_load_missing_returns_default() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("nonexistent.toml");
+
+        let memory = load_memory(&path);
+        assert!(memory.items.is_empty());
+    }
+
+    #[test]
+    fn memory_truncates_at_max() {
+        let mut memory = SettingsMemory::default();
+        for i in 0..60 {
+            memory.remember(MemoryItem {
+                kind: MemoryKind::Permission {
+                    category: "allow".to_string(),
+                },
+                value: serde_json::Value::String(format!("item-{i}")),
+                label: format!("item-{i}"),
+            });
+        }
+        assert_eq!(memory.items.len(), SettingsMemory::MAX_ITEMS);
     }
 
     #[test]
