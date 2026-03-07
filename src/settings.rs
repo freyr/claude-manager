@@ -297,11 +297,7 @@ pub enum SettingsEntry {
 ///
 /// Parses formatted display lines to determine the semantic type of each line.
 /// The result is parallel to `lines` — same length, same indices.
-pub fn build_entry_map(
-    lines: &[String],
-    line_map: &SettingsLineMap,
-    _collection: &SettingsCollection,
-) -> Vec<SettingsEntry> {
+pub fn build_entry_map(lines: &[String], line_map: &SettingsLineMap) -> Vec<SettingsEntry> {
     let mut entries = Vec::with_capacity(lines.len());
     let mut current_permission_category: Option<String> = None;
     let mut in_mcp_servers = false;
@@ -411,12 +407,11 @@ pub fn build_entry_map(
                 _ => {
                     entries.push(SettingsEntry::ScalarField {
                         file_idx,
-                        key: key.clone(),
+                        key,
                         value: val_str,
                     });
                 }
             }
-            // Check if this scalar is followed by permission/mcp content
             continue;
         }
 
@@ -476,22 +471,20 @@ fn parse_scalar_line(trimmed: &str) -> Option<(String, String)> {
 ///
 /// Pretty-prints the JSON with 2-space indentation and a trailing newline.
 pub fn write_settings_file(path: &Path, value: &serde_json::Value) -> anyhow::Result<()> {
+    use anyhow::Context;
     use std::io::Write;
 
-    let json = serde_json::to_string_pretty(value)
-        .map_err(|e| anyhow::anyhow!("failed to serialize settings: {e}"))?;
+    let json = serde_json::to_string_pretty(value).context("failed to serialize settings")?;
     let content = format!("{json}\n");
 
     let parent = path.parent().unwrap_or(Path::new("."));
-    let tmp = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|e| anyhow::anyhow!("failed to create temp file: {e}"))?;
-    let mut file = tmp;
-    file.write_all(content.as_bytes())
-        .map_err(|e| anyhow::anyhow!("failed to write temp file: {e}"))?;
-    file.flush()
-        .map_err(|e| anyhow::anyhow!("failed to flush temp file: {e}"))?;
-    file.persist(path)
-        .map_err(|e| anyhow::anyhow!("failed to persist settings file: {e}"))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent).context("failed to create temp file")?;
+    tmp.write_all(content.as_bytes())
+        .context("failed to write temp file")?;
+    tmp.flush().context("failed to flush temp file")?;
+    tmp.persist(path)
+        .map_err(|e| e.error)
+        .with_context(|| format!("failed to persist {}", path.display()))?;
 
     Ok(())
 }
@@ -916,7 +909,7 @@ mod tests {
     fn entry_map_identifies_section_header() {
         let collection = collection_from_json(r#"{"model":"opus"}"#);
         let (lines, line_map) = format_settings_with_map(&collection);
-        let entries = build_entry_map(&lines, &line_map, &collection);
+        let entries = build_entry_map(&lines, &line_map);
 
         assert_eq!(entries[0], SettingsEntry::SectionHeader { file_idx: 0 });
     }
@@ -925,7 +918,7 @@ mod tests {
     fn entry_map_identifies_boolean_field() {
         let collection = collection_from_json(r#"{"thinking":true}"#);
         let (lines, line_map) = format_settings_with_map(&collection);
-        let entries = build_entry_map(&lines, &line_map, &collection);
+        let entries = build_entry_map(&lines, &line_map);
 
         let bool_entry = entries
             .iter()
@@ -944,7 +937,7 @@ mod tests {
     fn entry_map_identifies_scalar_field() {
         let collection = collection_from_json(r#"{"model":"opus"}"#);
         let (lines, line_map) = format_settings_with_map(&collection);
-        let entries = build_entry_map(&lines, &line_map, &collection);
+        let entries = build_entry_map(&lines, &line_map);
 
         let scalar = entries
             .iter()
@@ -960,7 +953,7 @@ mod tests {
     fn entry_map_identifies_permission_header_and_items() {
         let collection = collection_from_json(r#"{"permissions":{"allow":["Read","Write"]}}"#);
         let (lines, line_map) = format_settings_with_map(&collection);
-        let entries = build_entry_map(&lines, &line_map, &collection);
+        let entries = build_entry_map(&lines, &line_map);
 
         let perm_header = entries.iter().find(|e| {
             matches!(e, SettingsEntry::PermissionHeader { category, .. } if category == "allow")
@@ -989,7 +982,7 @@ mod tests {
             r#"{"mcpServers":{"rust-cargo":{"command":"npx"},"ctx7":{"command":"node"}}}"#,
         );
         let (lines, line_map) = format_settings_with_map(&collection);
-        let entries = build_entry_map(&lines, &line_map, &collection);
+        let entries = build_entry_map(&lines, &line_map);
 
         let mcp_header = entries
             .iter()
@@ -1029,7 +1022,7 @@ mod tests {
             ],
         };
         let (lines, line_map) = format_settings_with_map(&collection);
-        let entries = build_entry_map(&lines, &line_map, &collection);
+        let entries = build_entry_map(&lines, &line_map);
 
         let blank_count = entries
             .iter()
@@ -1044,7 +1037,7 @@ mod tests {
             r#"{"model":"opus","thinking":true,"permissions":{"allow":["Read"]},"mcpServers":{"cargo":{"command":"npx"}}}"#,
         );
         let (lines, line_map) = format_settings_with_map(&collection);
-        let entries = build_entry_map(&lines, &line_map, &collection);
+        let entries = build_entry_map(&lines, &line_map);
 
         assert_eq!(
             entries.len(),

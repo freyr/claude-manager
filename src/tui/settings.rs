@@ -230,10 +230,10 @@ impl App {
             }
         };
 
-        self.settings_state.add_target = Some((file_idx, category.clone()));
+        self.status_message = Some(format!("Add to {category}:"));
+        self.settings_state.add_target = Some((file_idx, category));
         self.text_input.clear();
         self.mode = Mode::TitleInput;
-        self.status_message = Some(format!("Add to {category}:"));
     }
 
     /// Commits the add-permission input.
@@ -351,23 +351,20 @@ impl App {
         let Some(collection) = &self.settings_collection else {
             return;
         };
-        let display_collection;
-        let coll_ref = if self.settings_state.merged_view {
+        let (lines, line_map) = if self.settings_state.merged_view {
             let merged = crate::settings::merge_settings(collection);
-            display_collection = SettingsCollection {
+            let synthetic = SettingsCollection {
                 files: vec![SettingsFile {
                     label: "Effective".to_string(),
                     path: PathBuf::new(),
                     value: merged,
                 }],
             };
-            &display_collection
+            format_settings_with_map(&synthetic)
         } else {
-            display_collection = collection.clone();
-            &display_collection
+            format_settings_with_map(collection)
         };
-        let (lines, line_map) = format_settings_with_map(coll_ref);
-        let entry_map = build_entry_map(&lines, &line_map, coll_ref);
+        let entry_map = build_entry_map(&lines, &line_map);
         self.settings_state.lines = lines;
         self.settings_state.line_map = line_map;
         self.settings_state.entry_map = entry_map;
